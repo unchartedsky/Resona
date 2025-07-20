@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.14.36301.6 d17.14
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MiniaudioBypass", "MiniaudioBypass.vcxproj", "{4585B10C-6F90-4200-BF9A-C67705E42A05}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Resona", "Resona.vcxproj", "{4585B10C-6F90-4200-BF9A-C67705E42A05}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

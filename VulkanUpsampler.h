@@ -20,7 +20,7 @@ private:
     bool createPipeline(VkShaderModule shaderModule);
     bool uploadInputToGPU(const float* input, uint32_t totalSamples);
     bool downloadOutputFromGPU(float* output, uint32_t totalSamples);
-    bool dispatch(uint32_t inSamples, uint32_t outSamples, float ratio);
+    bool dispatch(uint32_t inSamples, uint32_t outSamples);
 	void cleanupPipeline();
     void cleanupBuffers();
 

@@ -133,7 +133,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="GpuUpsampler.h" />
-    <ClCompile Include="miniaudio_bypass.cpp" />
+    <ClCompile Include="main.cpp" />
     <ClCompile Include="VulkanUpsampler.cpp" />
   </ItemGroup>
   <ItemGroup>

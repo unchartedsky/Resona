@@ -72,7 +72,7 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
     if (!createDescriptorSet()) return false;
 
     // Step 5: dispatch
-    if (!dispatch(inSamples, outSamples, ratio)) return false;
+    if (!dispatch(inSamples, outSamples)) return false;
 
 	// Step 6: copy output data from GPU
     if (!downloadOutputFromGPU(output, outSamples)) return false;
@@ -458,7 +458,7 @@ bool VulkanUpsampler::createDescriptorSet() {
     return true;
 }
 
-bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples, float ratio) {
+bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
     if (computePipeline == VK_NULL_HANDLE || pipelineLayout == VK_NULL_HANDLE) {
         printf("[!] Pipeline not ready\n");
         return false;
@@ -493,7 +493,6 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples, float ra
         uint32_t outFrameCount;
         float ratio;
     };
-    uint32_t inFrameCount = inSamples / 2;
     uint32_t outFrameCount = outSamples / 2;
 
     PushConstants push;

@@ -22,7 +22,7 @@ struct FloatRingBuffer {
     std::vector<float> buffer;
     std::atomic<uint32_t> writePos{ 0 };
     std::atomic<uint32_t> readPos{ 0 };
-    uint32_t size;
+    uint32_t size{ 0 };
 
     void init(uint32_t totalSamples) {
         buffer.resize(totalSamples);
@@ -57,6 +57,9 @@ static FloatRingBuffer g_ring;
 
 void capture_callback(ma_device* device, void* output, const void* input, ma_uint32 frameCount)
 {
+	(void)output; // Unused in capture callback
+	(void)device; // Unused in capture callback
+
     if (!input || !g_upsampler) return;
 
     const float* in = (const float*)input;
@@ -70,6 +73,9 @@ void capture_callback(ma_device* device, void* output, const void* input, ma_uin
 
 void playback_callback(ma_device* device, void* output, const void* input, ma_uint32 frameCount)
 {
+	(void)input; // Unused in playback callback
+	(void)device; // Unused in playback callback
+
     float* out = (float*)output;
     const uint32_t requiredSamples = frameCount * 2;
 
@@ -136,5 +142,6 @@ int main()
 
     ma_device_uninit(&captureDevice);
     ma_device_uninit(&playbackDevice);
+    g_upsampler->shutdown();
     return 0;
 }

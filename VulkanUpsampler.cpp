@@ -57,28 +57,27 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
     const uint32_t outFrames = static_cast<uint32_t>(inputFrames * ratio);
     const uint32_t outSamples = outFrames * numChannels;
 
-    // Step 1: GPU 버퍼 준비
+	// Step 1: prepare GPU buffers
     if (!createBuffers(inputFrames)) return false;
 
-    // Step 2: 입력 복사
+	// Step 2: copy input data to GPU
     if (!uploadInputToGPU(input, inSamples)) return false;
 
-    // Step 3: 파이프라인 생성
+	// Step 3: create compute pipeline
     if (computePipeline == VK_NULL_HANDLE) {
         if (!createPipeline(shaderModule)) return false;
     }
 
+	// Step 4: create descriptor set
     if (!createDescriptorSet()) return false;
 
-    // Step 4: dispatch
+    // Step 5: dispatch
     if (!dispatch(inSamples, outSamples, ratio)) return false;
 
-    // Step 5: 출력 복사
-    printf("[debug] output pointer = %p | required size = %zu bytes\n", output, sizeof(float) * outSamples);
+	// Step 6: copy output data from GPU
     if (!downloadOutputFromGPU(output, outSamples)) return false;
 
     outputFrames = outFrames;
-    printf("[debug] outputFrames set = %u (from outFrames = %u)\n", outputFrames, outFrames);
     return true;
 }
 
@@ -259,11 +258,6 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
         VkMemoryRequirements memRequirements;
         vkGetBufferMemoryRequirements(device, buffer, &memRequirements);
 
-        printf("[debug] %s buffer mem req: size = %llu, alignment = %llu\n",
-            label,
-            static_cast<unsigned long long>(memRequirements.size),
-            static_cast<unsigned long long>(memRequirements.alignment));
-
         VkMemoryAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocInfo.allocationSize = memRequirements.size;
@@ -309,7 +303,6 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
 
     maxInputFrames = inputFrames;
 
-    printf("[debug] Vulkan output buffer size = %llu bytes\n", static_cast<unsigned long long>(outputSize));
     printf("[+] GPU buffers created: in=%.1f KB, out=%.1f KB\n",
         inputSize / 1024.0, outputSize / 1024.0);
 
@@ -539,8 +532,6 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples, float ra
     }
 
     vkQueueWaitIdle(computeQueue);
-
-    printf("[+] Dispatch completed: %u samples\n", outSamples);
     return true;
 }
 

@@ -78,12 +78,6 @@ void playback_callback(ma_device* device, void* output, const void* input, ma_ui
     if (actualSamples < requiredSamples) {
         std::memset(out + actualSamples, 0, (requiredSamples - actualSamples) * sizeof(float));
     }
-
-    printf("\r[playback] need=%u got=%u buffer=%u       ",
-        requiredSamples,
-        actualSamples,
-        g_ring.available());
-    fflush(stdout);
 }
 
 // === Main ===
@@ -134,7 +128,7 @@ int main()
         return -1;
     }
 
-    printf("[+] Real-time GPU upsampler started (44100 → 384000Hz)\n");
+    printf("[+] Real-time GPU upsampler started (44100 -> 384000Hz)\n");
 
     while (true) {
         ma_sleep(1000);

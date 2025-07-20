@@ -1,0 +1,39 @@
+﻿#version 450
+layout(local_size_x = 64) in;
+
+// 입력: stereo interleaved (L0, R0, L1, R1, ...)
+layout(binding = 0) readonly buffer InputBuffer {
+    float inSamples[];
+};
+
+// 출력: 동일한 interleaved 구조
+layout(binding = 1) writeonly buffer OutputBuffer {
+    float outSamples[];
+};
+
+// Push Constants: 프레임 단위
+layout(push_constant) uniform PushConstants {
+    uint inFrameCount;   // 입력 프레임 수 (샘플 수가 아님)
+    uint outFrameCount;  // 출력 프레임 수
+    float ratio;         // 출력 / 입력 프레임 비율
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.outFrameCount * 2) return;
+
+    uint channel = gid % 2;                // 0 = L, 1 = R
+    uint outFrameIndex = gid / 2;
+
+    float inFrameIndex = float(outFrameIndex) / pc.ratio;
+    uint baseFrame = uint(inFrameIndex);
+    float frac = inFrameIndex - float(baseFrame);
+
+    uint baseIndex = baseFrame * 2 + channel;
+    uint nextIndex = baseIndex + 2;
+
+    float s0 = (baseFrame < pc.inFrameCount) ? inSamples[baseIndex] : 0.0;
+    float s1 = (nextIndex < pc.inFrameCount * 2) ? inSamples[nextIndex] : s0;
+
+    outSamples[gid] = mix(s0, s1, frac);
+}

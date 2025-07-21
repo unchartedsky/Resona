@@ -70,7 +70,7 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
 
 	// Step 4: create descriptor set
     if (!createDescriptorSet()) return false;
-
+    
     // Step 5: dispatch
     if (!dispatch(inSamples, outSamples)) return false;
 
@@ -398,35 +398,39 @@ bool VulkanUpsampler::createDescriptorSet() {
         return false;
     }
 
-    // 1. Descriptor Pool 생성
-    VkDescriptorPoolSize poolSizes[1]{};
-    poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSizes[0].descriptorCount = 2;
+    if (descriptorPool == VK_NULL_HANDLE) {
+		// 1. Create Descriptor Pool
+        VkDescriptorPoolSize poolSizes[1]{};
+        poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        poolSizes[0].descriptorCount = 2;
 
-    VkDescriptorPoolCreateInfo poolInfo{};
-    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.poolSizeCount = 1;
-    poolInfo.pPoolSizes = poolSizes;
-    poolInfo.maxSets = 1;
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = poolSizes;
+        poolInfo.maxSets = 1;
 
-    if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
-        printf("[!] Failed to create descriptor pool\n");
-        return false;
+        if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
+            printf("[!] Failed to create descriptor pool\n");
+            return false;
+        }
     }
 
-    // 2. DescriptorSet 할당
-    VkDescriptorSetAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocInfo.descriptorPool = descriptorPool;
-    allocInfo.descriptorSetCount = 1;
-    allocInfo.pSetLayouts = &descriptorSetLayout;
+    if (descriptorSet == VK_NULL_HANDLE) {
+		// 2. Allocate Descriptor Set
+        VkDescriptorSetAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocInfo.descriptorPool = descriptorPool;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &descriptorSetLayout;
 
-    if (vkAllocateDescriptorSets(device, &allocInfo, &descriptorSet) != VK_SUCCESS) {
-        printf("[!] Failed to allocate descriptor set\n");
-        return false;
+        if (vkAllocateDescriptorSets(device, &allocInfo, &descriptorSet) != VK_SUCCESS) {
+            printf("[!] Failed to allocate descriptor set\n");
+            return false;
+        }
     }
 
-    // 3. DescriptorSet 업데이트
+    // 3. Always update descriptor set (in case buffers are reallocated)
     VkDescriptorBufferInfo inputInfo{};
     inputInfo.buffer = inputBuffer;
     inputInfo.offset = 0;

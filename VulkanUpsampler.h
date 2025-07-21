@@ -2,6 +2,7 @@
 #include "GpuUpsampler.h"
 #include <vulkan/vulkan.h>
 #include <string>
+#include <vector>
 
 /**
  * @brief Vulkan-based GPU audio upsampler implementation.
@@ -36,6 +37,8 @@ private:
         uint32_t outFrameCount;
         float ratio;
     };
+
+    std::vector<float> previousTail;
 
     // === Configuration ===
     ResampleKernel selectedKernel = ResampleKernel::Linear;

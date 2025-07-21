@@ -54,14 +54,22 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
 
     const float ratio = static_cast<float>(outRate) / inRate;
     const uint32_t inSamples = inputFrames * numChannels;
-    const uint32_t outFrames = static_cast<uint32_t>(inputFrames * ratio);
-    const uint32_t outSamples = outFrames * numChannels;
+
+    // Step 0: Create extended input: tail + current input
+    std::vector<float> fullInput;
+    fullInput.insert(fullInput.end(), previousTail.begin(), previousTail.end());
+    fullInput.insert(fullInput.end(), input, input + inSamples);
+
+    const uint32_t fullInSamples = static_cast<uint32_t>(fullInput.size());
+    const uint32_t fullInFrames = fullInSamples / numChannels;
+    const uint32_t outFramesAll = static_cast<uint32_t>(fullInFrames * ratio);
+    const uint32_t outSamplesAll = outFramesAll * numChannels;
 
     // Step 1: prepare GPU buffers
-    if (!createBuffers(inputFrames)) return false;
+    if (!createBuffers(fullInFrames)) return false;
 
     // Step 2: copy input data to GPU
-    if (!uploadInputToGPU(input, inSamples)) return false;
+    if (!uploadInputToGPU(fullInput.data(), fullInSamples)) return false;
 
     // Step 3: create compute pipeline
     if (computePipeline == VK_NULL_HANDLE) {
@@ -72,12 +80,34 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
     if (!createDescriptorSet()) return false;
 
     // Step 5: dispatch
-    if (!dispatch(inSamples, outSamples)) return false;
+    if (!dispatch(fullInSamples, outSamplesAll)) return false;
 
     // Step 6: copy output data from GPU
-    if (!downloadOutputFromGPU(output, outSamples)) return false;
+    std::vector<float> fullOutput(outSamplesAll);
+    if (!downloadOutputFromGPU(fullOutput.data(), outSamplesAll)) return false;
 
-    outputFrames = outFrames;
+    // Step 7: Skip front portion that corresponds to tail
+    const uint32_t tailFrames = static_cast<uint32_t>(previousTail.size() / numChannels);
+    const uint32_t skipFrames = static_cast<uint32_t>(tailFrames * ratio);
+    const uint32_t actualOutFrames = outFramesAll - skipFrames;
+
+    std::memcpy(
+        output,
+        fullOutput.data() + skipFrames * numChannels,
+        actualOutFrames * numChannels * sizeof(float)
+    );
+    outputFrames = actualOutFrames;
+
+    // Step 8: update tail from current input
+    const uint32_t tailStoreFrames = 4;  // adjustable
+    const uint32_t tailStoreSamples = tailStoreFrames * numChannels;
+    if (inSamples >= tailStoreSamples) {
+        previousTail.assign(input + inSamples - tailStoreSamples, input + inSamples);
+    }
+    else {
+        previousTail.assign(input, input + inSamples);
+    }
+
     return true;
 }
 

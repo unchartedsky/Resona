@@ -57,24 +57,24 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
     const uint32_t outFrames = static_cast<uint32_t>(inputFrames * ratio);
     const uint32_t outSamples = outFrames * numChannels;
 
-	// Step 1: prepare GPU buffers
+    // Step 1: prepare GPU buffers
     if (!createBuffers(inputFrames)) return false;
 
-	// Step 2: copy input data to GPU
+    // Step 2: copy input data to GPU
     if (!uploadInputToGPU(input, inSamples)) return false;
 
-	// Step 3: create compute pipeline
+    // Step 3: create compute pipeline
     if (computePipeline == VK_NULL_HANDLE) {
         if (!createPipeline(shaderModule)) return false;
     }
 
-	// Step 4: create descriptor set
+    // Step 4: create descriptor set
     if (!createDescriptorSet()) return false;
-    
+
     // Step 5: dispatch
     if (!dispatch(inSamples, outSamples)) return false;
 
-	// Step 6: copy output data from GPU
+    // Step 6: copy output data from GPU
     if (!downloadOutputFromGPU(output, outSamples)) return false;
 
     outputFrames = outFrames;
@@ -399,7 +399,7 @@ bool VulkanUpsampler::createDescriptorSet() {
     }
 
     if (descriptorPool == VK_NULL_HANDLE) {
-		// 1. Create Descriptor Pool
+        // 1. Create Descriptor Pool
         VkDescriptorPoolSize poolSizes[1]{};
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         poolSizes[0].descriptorCount = 2;
@@ -417,7 +417,7 @@ bool VulkanUpsampler::createDescriptorSet() {
     }
 
     if (descriptorSet == VK_NULL_HANDLE) {
-		// 2. Allocate Descriptor Set
+        // 2. Allocate Descriptor Set
         VkDescriptorSetAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         allocInfo.descriptorPool = descriptorPool;

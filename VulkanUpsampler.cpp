@@ -91,10 +91,19 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
     const uint32_t skipFrames = static_cast<uint32_t>(tailFrames * ratio);
     const uint32_t actualOutFrames = outFramesAll - skipFrames;
 
+    const uint32_t skipOffset = skipFrames * numChannels;
+    const uint32_t outCopyCount = actualOutFrames * numChannels;
+
+    if (skipOffset + outCopyCount > fullOutput.size()) {
+        printf("[!] Output memcpy out-of-bounds risk: skip=%u, copy=%u, total=%zu\n",
+            skipOffset, outCopyCount, fullOutput.size());
+        return false;
+    }
+
     std::memcpy(
         output,
-        fullOutput.data() + skipFrames * numChannels,
-        actualOutFrames * numChannels * sizeof(float)
+        fullOutput.data() + skipOffset,
+        outCopyCount * sizeof(float)
     );
     outputFrames = actualOutFrames;
 
@@ -528,7 +537,7 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
     PushConstants push;
     push.inFrameCount = inSamples / 2;
     push.outFrameCount = outSamples / 2;
-    push.ratio = static_cast<float>(push.outFrameCount) / push.inFrameCount;
+    push.ratio = static_cast<float>(outRate) / inRate;
 
     vkCmdPushConstants(
         commandBuffer,

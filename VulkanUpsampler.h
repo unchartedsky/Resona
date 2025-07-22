@@ -46,6 +46,7 @@ private:
     uint32_t outRate = 0;
     uint32_t numChannels = 2;
     uint32_t maxInputFrames = 0;
+    uint32_t maxOutputSamples = 0;
 
     // === Vulkan handles ===
     VkInstance instance = VK_NULL_HANDLE;

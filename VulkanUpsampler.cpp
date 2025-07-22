@@ -1,4 +1,4 @@
-﻿#include "VulkanUpsampler.h"
+#include "VulkanUpsampler.h"
 #include <vulkan/vulkan.h>
 #include <cstdio>
 #include <cstring>
@@ -243,13 +243,13 @@ VkShaderModule VulkanUpsampler::createShaderModule(const std::string& filename) 
 
 bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
     uint32_t totalInputSamples = inputFrames * numChannels;
+    uint32_t totalOutputSamples = static_cast<uint32_t>(inputFrames * (static_cast<float>(outRate) / inRate)) * numChannels;
 
-    // 이미 충분한 buffer가 있으면 재사용
-    if (inputFrames <= maxInputFrames) {
+    if (inputFrames <= maxInputFrames && totalOutputSamples <= maxOutputSamples) {
         return true;
     }
 
-    // 기존 buffer/memory 해제
+    // 기존 buffer 해제
     if (inputBuffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(device, inputBuffer, nullptr);
         inputBuffer = VK_NULL_HANDLE;
@@ -267,12 +267,9 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
         outputMemory = VK_NULL_HANDLE;
     }
 
-    // 새로운 버퍼 크기
     VkDeviceSize inputSize = sizeof(float) * totalInputSamples;
-    uint32_t totalOutputSamples = static_cast<uint32_t>(inputFrames * (static_cast<float>(outRate) / inRate)) * numChannels;
     VkDeviceSize outputSize = sizeof(float) * totalOutputSamples;
 
-    // 공통 버퍼 생성 함수
     auto createBuffer = [&](VkDeviceSize size, VkBuffer& buffer, VkDeviceMemory& memory, const char* label) -> bool {
         VkBufferCreateInfo bufferInfo{};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -292,7 +289,6 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocInfo.allocationSize = memRequirements.size;
 
-        // HOST_VISIBLE + HOST_COHERENT → 직접 맵핑해서 사용
         VkPhysicalDeviceMemoryProperties memProps;
         vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
 
@@ -319,19 +315,19 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
             return false;
         }
 
-        VkResult bindResult = vkBindBufferMemory(device, buffer, memory, 0);
-        if (bindResult != VK_SUCCESS) {
-            printf("[!] Failed to bind memory for %s buffer (code = %d)\n", label, bindResult);
+        if (vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
+            printf("[!] Failed to bind memory for %s buffer\n", label);
             return false;
         }
 
         return true;
-        };
+    };
 
     if (!createBuffer(inputSize, inputBuffer, inputMemory, "input")) return false;
     if (!createBuffer(outputSize, outputBuffer, outputMemory, "output")) return false;
 
     maxInputFrames = inputFrames;
+    maxOutputSamples = totalOutputSamples;
 
     printf("[+] GPU buffers created: in=%.1f KB, out=%.1f KB (frames=%u)\n",
         inputSize / 1024.0, outputSize / 1024.0, inputFrames);

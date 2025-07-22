@@ -364,3 +364,6 @@ FodyWeavers.xsd
 
 # Exclude local miniaudio
 miniaudio.h
+
+# Exclude generated SPRI-V binaries
+*.spv

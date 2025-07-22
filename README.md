@@ -37,3 +37,8 @@ Spotify → VB-CABLE → Resona → DAC
 - **VB-CABLE**: Virtual audio device for routing output  
 - **Resona**: GPU-based audio upsampler (Vulkan)  
 - **DAC**: Final audio output device
+
+## 🪪 License
+
+This project is licensed under the [MIT No Attribution (MIT-0)](LICENSE) license.  
+You may use, modify, and distribute it freely without attribution.

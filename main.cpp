@@ -77,7 +77,7 @@ void capture_callback(ma_device* device, void* output, const void* input, ma_uin
     uint32_t outFrames = 0;
 
     g_upsampler->process(in, frameCount, outputBuffer, outFrames);
-
+    
     const uint32_t outSamples = outFrames * 2;
     g_ring.push(outputBuffer, outSamples);
 }
@@ -139,11 +139,23 @@ int main()
         return -1;
     }
 
-    if (ma_device_start(&captureDevice) != MA_SUCCESS ||
-        ma_device_start(&playbackDevice) != MA_SUCCESS) {
-        printf("[!] Failed to start one of the devices\n");
-        ma_device_uninit(&captureDevice);
+    // Start capture device first
+    if (ma_device_start(&captureDevice) != MA_SUCCESS) {
+        printf("[!] Failed to start capture device\n");
         ma_device_uninit(&playbackDevice);
+        return -1;
+    }
+
+    // Prebuffer wait
+    while (g_ring.available() < 192000) {
+        printf("[*] Waiting for prebuffer... %u samples buffered\r", g_ring.available());
+        ma_sleep(10);
+    }
+
+    // Then start playback
+    if (ma_device_start(&playbackDevice) != MA_SUCCESS) {
+        printf("[!] Failed to start playback device\n");
+        ma_device_uninit(&captureDevice);
         return -1;
     }
 

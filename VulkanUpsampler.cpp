@@ -333,8 +333,8 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
 
     maxInputFrames = inputFrames;
 
-    printf("[+] GPU buffers created: in=%.1f KB, out=%.1f KB\n",
-        inputSize / 1024.0, outputSize / 1024.0);
+    printf("[+] GPU buffers created: in=%.1f KB, out=%.1f KB (frames=%u)\n",
+        inputSize / 1024.0, outputSize / 1024.0, inputFrames);
 
     return true;
 }

@@ -22,7 +22,7 @@ void signal_handler(int signal)
     }
 }
 
-constexpr uint32_t ringBufferSamples = 384000 * 2; // 1초 (stereo)
+constexpr uint32_t ringBufferSamples = 384000 * 4;
 constexpr uint32_t maxOutFrames = 48000 * 8;
 
 static std::unique_ptr<GpuUpsampler> g_upsampler;

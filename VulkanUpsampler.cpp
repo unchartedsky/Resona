@@ -86,26 +86,20 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
     std::vector<float> fullOutput(outSamplesAll);
     if (!downloadOutputFromGPU(fullOutput.data(), outSamplesAll)) return false;
 
-    // Step 7: Skip front portion that corresponds to tail
-    const uint32_t tailFrames = static_cast<uint32_t>(previousTail.size() / numChannels);
-    const uint32_t skipFrames = static_cast<uint32_t>(tailFrames * ratio);
-    const uint32_t actualOutFrames = outFramesAll - skipFrames;
+    // Step 7: Skip front portion that corresponds to tail (floating point precision)
+    const float tailFramesF = static_cast<float>(previousTail.size()) / numChannels;
+    const float skipFramesF = tailFramesF * ratio;
+    const uint32_t skipOffset = static_cast<uint32_t>(skipFramesF * numChannels);
 
-    const uint32_t skipOffset = skipFrames * numChannels;
-    const uint32_t outCopyCount = actualOutFrames * numChannels;
-
-    if (skipOffset + outCopyCount > fullOutput.size()) {
-        printf("[!] Output memcpy out-of-bounds risk: skip=%u, copy=%u, total=%zu\n",
-            skipOffset, outCopyCount, fullOutput.size());
+    if (skipOffset > fullOutput.size()) {
+        printf("[!] Output memcpy out-of-bounds: skip=%u > total=%zu\n",
+            skipOffset, fullOutput.size());
         return false;
     }
 
-    std::memcpy(
-        output,
-        fullOutput.data() + skipOffset,
-        outCopyCount * sizeof(float)
-    );
-    outputFrames = actualOutFrames;
+    const uint32_t outCopyCount = static_cast<uint32_t>(fullOutput.size()) - skipOffset;
+    std::memcpy(output, fullOutput.data() + skipOffset, outCopyCount * sizeof(float));
+    outputFrames = outCopyCount / numChannels;
 
     // Step 8: update tail from current input
     const uint32_t tailStoreFrames = 4;  // adjustable
@@ -537,7 +531,8 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
     PushConstants push;
     push.inFrameCount = inSamples / 2;
     push.outFrameCount = outSamples / 2;
-    push.ratio = static_cast<float>(outRate) / inRate;
+    double preciseRatio = static_cast<double>(outRate) / inRate;
+    push.ratio = static_cast<float>(preciseRatio);
 
     vkCmdPushConstants(
         commandBuffer,

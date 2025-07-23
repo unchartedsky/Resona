@@ -559,12 +559,20 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
 
-    if (vkQueueSubmit(computeQueue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS) {
-        printf("[!] Failed to submit compute queue\n");
-        return false;
-    }
+    // 1. Fence 생성
+    VkFence fence;
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    vkCreateFence(device, &fenceInfo, nullptr, &fence);
 
-    vkQueueWaitIdle(computeQueue);
+    // 2. Submit
+    vkQueueSubmit(computeQueue, 1, &submitInfo, fence);
+
+    // 3. GPU 작업 완료 대기 (타임아웃: UINT64_MAX == 무한대기)
+    vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+
+    // 4. fence 삭제
+    vkDestroyFence(device, fence, nullptr);
     return true;
 }
 

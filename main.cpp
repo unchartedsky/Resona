@@ -43,19 +43,28 @@ struct FloatRingBuffer {
     }
 
     void push(const float* data, uint32_t count) {
-        for (uint32_t i = 0; i < count; ++i) {
-            buffer[writePos % size] = data[i];
-            writePos++;
-        }
+        uint32_t w = writePos.load(std::memory_order_relaxed);
+        for (uint32_t i = 0; i < count; ++i)
+            buffer[(w + i) % size] = data[i];
+        writePos.store(w + count, std::memory_order_release);
     }
 
     uint32_t pop(float* out, uint32_t count) {
-        uint32_t available = writePos.load() - readPos.load();
-        uint32_t toRead = (count < available) ? count : available;
-        for (uint32_t i = 0; i < toRead; ++i) {
-            out[i] = buffer[readPos % size];
-            readPos++;
+        uint32_t r = readPos.load(std::memory_order_relaxed);
+        uint32_t w = writePos.load(std::memory_order_acquire);
+        uint32_t available = w - r;
+        uint32_t toRead = std::min(count, available);
+
+        for (uint32_t i = 0; i < toRead; ++i)
+            out[i] = buffer[(r + i) % size];
+
+        readPos.store(r + toRead, std::memory_order_release);
+
+        if (toRead < count) {
+            std::memset(out + toRead, 0, (count - toRead) * sizeof(float));
+            printf("[!] Underrun: only %u / %u samples\n", toRead, count);
         }
+
         return toRead;
     }
 

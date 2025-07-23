@@ -22,7 +22,7 @@ void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= pc.outFrameCount * 2) return;
 
-    uint channel = gid % 2;                // 0 = L, 1 = R
+    uint channel = 1 - (gid % 2); // 0 = R, 1 = L
     uint outFrameIndex = gid / 2;
 
     float inFrameIndex = float(outFrameIndex) / pc.ratio;

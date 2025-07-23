@@ -1,4 +1,4 @@
-#define NOMINMAX
+﻿#define NOMINMAX
 
 #include <cstdio>
 #include <cstring>
@@ -15,6 +15,7 @@
 #include "VulkanUpsampler.h"
 
 std::atomic<bool> g_running{ true };
+std::atomic<bool> g_underrun{ false };
 
 void signal_handler(int signal)
 {
@@ -105,6 +106,7 @@ void playback_callback(ma_device* device, void* output, const void* input, ma_ui
 
     if (actualSamples < requiredSamples) {
         std::memset(out + actualSamples, 0, (requiredSamples - actualSamples) * sizeof(float));
+        g_underrun = true;
     }
 }
 
@@ -173,7 +175,28 @@ int main()
     printf("[+] Real-time GPU upsampler started (44100 -> 384000Hz)\n");
 
     while (g_running) {
-        ma_sleep(1000);
+        if (g_underrun.exchange(false)) {
+            printf("\n[!] Underrun detected. Re-buffering...\n");
+
+            // Stop playback temporarily
+            ma_device_stop(&playbackDevice);
+
+            // Wait until enough samples are buffered again
+            while (g_ring.available() < 192000) {
+                printf("[*] Buffered: %u samples\r", g_ring.available());
+                ma_sleep(10);
+            }
+
+            // Restart playback
+            if (ma_device_start(&playbackDevice) != MA_SUCCESS) {
+                printf("[!] Failed to restart playback after underrun\n");
+                break;
+            }
+
+            printf("[+] Playback resumed after underrun\n");
+        }
+
+        ma_sleep(100); // Sleep to reduce CPU usage
     }
 
     ma_device_uninit(&captureDevice);

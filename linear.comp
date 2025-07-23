@@ -1,7 +1,7 @@
 ﻿#version 450
 layout(local_size_x = 64) in;
 
-// input: stereo interleaved (L0, R0, L1, R1, ...)
+// input: stereo interleaved (R0, L0, R1, L1, ...)
 layout(binding = 0) readonly buffer InputBuffer {
     float inSamples[];
 };

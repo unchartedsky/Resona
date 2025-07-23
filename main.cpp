@@ -1,8 +1,4 @@
-﻿#define MINIAUDIO_IMPLEMENTATION
-#include "miniaudio.h"
-
-#include "GpuUpsampler.h"
-#include "VulkanUpsampler.h"
+#define NOMINMAX
 
 #include <cstdio>
 #include <cstring>
@@ -11,6 +7,12 @@
 #include <atomic>
 #include <algorithm>
 #include <csignal>
+
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
+
+#include "GpuUpsampler.h"
+#include "VulkanUpsampler.h"
 
 std::atomic<bool> g_running{ true };
 

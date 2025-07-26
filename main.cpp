@@ -89,7 +89,7 @@ void capture_callback(ma_device* device, void* output, const void* input, ma_uin
     uint32_t outFrames = 0;
 
     g_upsampler->process(in, frameCount, outputBuffer, outFrames);
-    
+
     const uint32_t outSamples = outFrames * 2;
     g_ring.push(outputBuffer, outSamples);
 }
@@ -201,7 +201,7 @@ int main()
 
     ma_device_uninit(&captureDevice);
     ma_device_uninit(&playbackDevice);
-    
+
     if (g_upsampler) {
         g_upsampler->shutdown();
         g_upsampler.reset();

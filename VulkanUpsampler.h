@@ -29,6 +29,11 @@ private:
     bool downloadOutputFromGPU(float* output, uint32_t totalSamples);
     bool dispatch(uint32_t inSamples, uint32_t outSamples);
 
+    void* inputMappedPtr = nullptr;
+    void* outputMappedPtr = nullptr;
+    VkMemoryPropertyFlags inputMemoryProperties = 0;
+    VkMemoryPropertyFlags outputMemoryProperties = 0;
+
     /**
      * @brief Push constant structure (must match shader layout)
      */

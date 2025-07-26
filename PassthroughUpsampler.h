@@ -1,5 +1,4 @@
-﻿// PassthroughUpsampler.h
-#pragma once
+﻿#pragma once
 #include "GpuUpsampler.h"
 #include <cstring>
 

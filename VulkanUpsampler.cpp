@@ -1,4 +1,4 @@
-#include "VulkanUpsampler.h"
+﻿#include "VulkanUpsampler.h"
 #include <vulkan/vulkan.h>
 #include <cstdio>
 #include <cstring>
@@ -21,7 +21,7 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
 void VulkanUpsampler::setKernel(ResampleKernel kernel) {
     selectedKernel = kernel;
 
-    // 이전 shaderModule 정리
+    // Previous shaderModule cleanup
     if (shaderModule != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device, shaderModule, nullptr);
         shaderModule = VK_NULL_HANDLE;
@@ -252,28 +252,13 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
         return true;
     }
 
-    // 기존 buffer 해제
-    if (inputBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device, inputBuffer, nullptr);
-        inputBuffer = VK_NULL_HANDLE;
-    }
-    if (outputBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device, outputBuffer, nullptr);
-        outputBuffer = VK_NULL_HANDLE;
-    }
-    if (inputMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(device, inputMemory, nullptr);
-        inputMemory = VK_NULL_HANDLE;
-    }
-    if (outputMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(device, outputMemory, nullptr);
-        outputMemory = VK_NULL_HANDLE;
-    }
+    // Release existing buffers
+    cleanupBuffers();
 
     VkDeviceSize inputSize = sizeof(float) * totalInputSamples;
     VkDeviceSize outputSize = sizeof(float) * totalOutputSamples;
 
-    auto createBuffer = [&](VkDeviceSize size, VkBuffer& buffer, VkDeviceMemory& memory, const char* label) -> bool {
+    auto createBuffer = [&](VkDeviceSize size, VkBuffer& buffer, VkDeviceMemory& memory, void** mappedPtr, const char* label) -> bool {
         VkBufferCreateInfo bufferInfo{};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         bufferInfo.size = size;
@@ -302,6 +287,14 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
                     (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
                 (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
                 allocInfo.memoryTypeIndex = i;
+
+                if (std::string(label) == "input") {
+                    inputMemoryProperties = memProps.memoryTypes[i].propertyFlags;
+                }
+                else if (std::string(label) == "output") {
+                    outputMemoryProperties = memProps.memoryTypes[i].propertyFlags;
+                }
+
                 found = true;
                 break;
             }
@@ -323,11 +316,17 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
             return false;
         }
 
-        return true;
-    };
+        // Persistent Mapping
+        if (vkMapMemory(device, memory, 0, size, 0, mappedPtr) != VK_SUCCESS) {
+            printf("[!] Failed to map %s memory\n", label);
+            return false;
+        }
 
-    if (!createBuffer(inputSize, inputBuffer, inputMemory, "input")) return false;
-    if (!createBuffer(outputSize, outputBuffer, outputMemory, "output")) return false;
+        return true;
+        };
+
+    if (!createBuffer(inputSize, inputBuffer, inputMemory, &inputMappedPtr, "input")) return false;
+    if (!createBuffer(outputSize, outputBuffer, outputMemory, &outputMappedPtr, "output")) return false;
 
     maxInputFrames = inputFrames;
     maxOutputSamples = totalOutputSamples;
@@ -339,20 +338,23 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
 }
 
 bool VulkanUpsampler::uploadInputToGPU(const float* input, uint32_t totalSamples) {
-    if (inputMemory == VK_NULL_HANDLE) {
-        printf("[!] Input memory not allocated\n");
+    if (!inputMappedPtr) {
+        printf("[!] Input memory not mapped\n");
         return false;
     }
 
-    void* data = nullptr;
-    VkResult result = vkMapMemory(device, inputMemory, 0, sizeof(float) * totalSamples, 0, &data);
-    if (result != VK_SUCCESS) {
-        printf("[!] Failed to map input memory (error %d)\n", result);
-        return false;
+    VkDeviceSize size = sizeof(float) * totalSamples;
+    std::memcpy(inputMappedPtr, input, size);
+
+    if (!(inputMemoryProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+        VkMappedMemoryRange flushRange{};
+        flushRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        flushRange.memory = inputMemory;
+        flushRange.offset = 0;
+        flushRange.size = size;
+        vkFlushMappedMemoryRanges(device, 1, &flushRange);
     }
 
-    std::memcpy(data, input, sizeof(float) * totalSamples);
-    vkUnmapMemory(device, inputMemory);
     return true;
 }
 
@@ -559,7 +561,7 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
 
-    // 1. Fence 생성
+    // 1. Create a fence to ensure the command buffer has finished executing
     VkFence fence;
     VkFenceCreateInfo fenceInfo{};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -568,29 +570,36 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
     // 2. Submit
     vkQueueSubmit(computeQueue, 1, &submitInfo, fence);
 
-    // 3. GPU 작업 완료 대기 (타임아웃: UINT64_MAX == 무한대기)
+    // 3. Wait for GPU to finish (Timeout: UINT64_MAX == infinite wait)
     vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
 
-    // 4. fence 삭제
+    // 4. Destroy the fence
     vkDestroyFence(device, fence, nullptr);
     return true;
 }
 
 bool VulkanUpsampler::downloadOutputFromGPU(float* output, uint32_t totalSamples) {
-    if (outputMemory == VK_NULL_HANDLE) {
-        printf("[!] Output memory not allocated\n");
+    if (outputMappedPtr == nullptr) {
+        printf("[!] Output memory not mapped\n");
         return false;
     }
 
-    void* data = nullptr;
-    VkResult result = vkMapMemory(device, outputMemory, 0, sizeof(float) * totalSamples, 0, &data);
-    if (result != VK_SUCCESS) {
-        printf("[!] Failed to map output memory (error %d)\n", result);
-        return false;
+    // Non-coherent memory must be invalidated before reading
+    if (!(outputMemoryProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+        VkMappedMemoryRange range{};
+        range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        range.memory = outputMemory;
+        range.offset = 0;
+        range.size = sizeof(float) * totalSamples;
+
+        VkResult invalidateResult = vkInvalidateMappedMemoryRanges(device, 1, &range);
+        if (invalidateResult != VK_SUCCESS) {
+            printf("[!] vkInvalidateMappedMemoryRanges failed (error %d)\n", invalidateResult);
+            return false;
+        }
     }
 
-    std::memcpy(output, data, sizeof(float) * totalSamples);
-    vkUnmapMemory(device, outputMemory);
+    std::memcpy(output, outputMappedPtr, sizeof(float) * totalSamples);
     return true;
 }
 
@@ -614,6 +623,14 @@ void VulkanUpsampler::cleanupPipeline() {
 }
 
 void VulkanUpsampler::cleanupBuffers() {
+    if (inputMappedPtr) {
+        vkUnmapMemory(device, inputMemory);
+        inputMappedPtr = nullptr;
+    }
+    if (outputMappedPtr) {
+        vkUnmapMemory(device, outputMemory);
+        outputMappedPtr = nullptr;
+    }
     if (inputBuffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(device, inputBuffer, nullptr);
         inputBuffer = VK_NULL_HANDLE;

@@ -33,7 +33,7 @@ void main() {
     if (baseFrame + 1 >= pc.inFrameCount) {
         uint baseIndex = baseFrame * 2 + channel;
         float s0 = (baseIndex < pc.inFrameCount * 2) ? inSamples[baseIndex] : 0.0;
-        outSamples[gid] = clamp(s0, -1.0, 1.0);
+        outSamples[gid] = max(-1.0, min(1.0, s0));
         return;
     }
 

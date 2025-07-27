@@ -1,4 +1,4 @@
-#include "VulkanUpsampler.h"
+﻿#include "VulkanUpsampler.h"
 #include <vulkan/vulkan.h>
 #include <cstdio>
 #include <cstring>
@@ -62,11 +62,13 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
 
     const uint32_t fullInSamples = static_cast<uint32_t>(fullInput.size());
     const uint32_t fullInFrames = fullInSamples / numChannels;
-    const uint32_t outFramesAll = static_cast<uint32_t>(fullInFrames * ratio);
-    const uint32_t outSamplesAll = outFramesAll * numChannels;
+
+    // Predict max possible input frames and output samples
+    constexpr uint32_t maxTailFrames = 4; // matches tailStoreFrames below
+    const uint32_t maxExpectedInFrames = inputFrames + maxTailFrames;
 
     // Step 1: prepare GPU buffers
-    if (!createBuffers(fullInFrames)) return false;
+    if (!createBuffers(maxExpectedInFrames)) return false;
 
     // Step 2: copy input data to GPU
     if (!uploadInputToGPU(fullInput.data(), fullInSamples)) return false;
@@ -80,11 +82,13 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
     if (!createDescriptorSet()) return false;
 
     // Step 5: dispatch
-    if (!dispatch(fullInSamples, outSamplesAll)) return false;
+    const uint32_t actualOutFrames = static_cast<uint32_t>(fullInFrames * ratio);
+    const uint32_t actualOutSamples = actualOutFrames * numChannels;
+    if (!dispatch(fullInSamples, actualOutSamples)) return false;
 
     // Step 6: copy output data from GPU
-    std::vector<float> fullOutput(outSamplesAll);
-    if (!downloadOutputFromGPU(fullOutput.data(), outSamplesAll)) return false;
+    std::vector<float> fullOutput(actualOutSamples);
+    if (!downloadOutputFromGPU(fullOutput.data(), actualOutSamples)) return false;
 
     // Step 7: Skip front portion that corresponds to tail (floating point precision)
     const float tailFramesF = static_cast<float>(previousTail.size()) / numChannels;
@@ -102,7 +106,7 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
     outputFrames = outCopyCount / numChannels;
 
     // Step 8: update tail from current input
-    const uint32_t tailStoreFrames = 4;  // adjustable
+    const uint32_t tailStoreFrames = maxTailFrames;
     const uint32_t tailStoreSamples = tailStoreFrames * numChannels;
     if (inSamples >= tailStoreSamples) {
         previousTail.assign(input + inSamples - tailStoreSamples, input + inSamples);

@@ -546,8 +546,10 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
     );
 
     // Dispatch
-    uint32_t totalSampleThreads = outFrameCount * 2;
-    uint32_t groupCount = (totalSampleThreads + 63) / 64;
+    uint32_t totalSampleThreads = outFrameCount * 2; // Stereo → 2 samples per frame
+    uint32_t localSizeX = 64;                        // Must match shader local size
+    uint32_t groupCount = (totalSampleThreads + localSizeX - 1) / localSizeX;
+
     vkCmdDispatch(commandBuffer, groupCount, 1, 1);
 
     if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {

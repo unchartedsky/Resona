@@ -100,6 +100,10 @@ private:
     uint32_t maxOutputSamples = 0;
     std::vector<float> previousTail;
 
+    // === Performance Buffers ===
+    std::vector<float> workingInputBuffer;   ///< Reusable buffer for input processing
+    std::vector<float> workingOutputBuffer;  ///< Reusable buffer for output processing
+
     // === Memory Management ===
     void* inputMappedPtr = nullptr;
     void* outputMappedPtr = nullptr;

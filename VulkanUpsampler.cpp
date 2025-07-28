@@ -40,8 +40,18 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
         return false;
     }
 
+    // === Pre-allocate working buffers based on expected usage ===
+    const float ratio = static_cast<float>(outputRate) / inputRate;
+    const uint32_t estimatedInputSamples = 2048 * channels;  // Typical frame size
+    const uint32_t estimatedOutputSamples = static_cast<uint32_t>(estimatedInputSamples * ratio);
+    
+    workingInputBuffer.reserve(estimatedInputSamples * 2);   // Extra headroom
+    workingOutputBuffer.reserve(estimatedOutputSamples * 2); // Extra headroom
+    
     printf("[+] VulkanUpsampler initialized: %uHz -> %uHz (%u channels)\n", 
            inputRate, outputRate, channels);
+    printf("[*] Pre-allocated buffers: input=%zu, output=%zu samples\n",
+           workingInputBuffer.capacity(), workingOutputBuffer.capacity());
     return true;
 }
 
@@ -86,13 +96,21 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
     const float ratio = static_cast<float>(outRate) / inRate;
     const uint32_t inSamples = inputFrames * numChannels;
 
-    // Create extended input: previous tail + current input
-    std::vector<float> fullInput;
-    fullInput.reserve(previousTail.size() + inSamples);
-    fullInput.insert(fullInput.end(), previousTail.begin(), previousTail.end());
-    fullInput.insert(fullInput.end(), input, input + inSamples);
+    // === Optimized input buffer management ===
+    const uint32_t totalInputSamples = previousTail.size() + inSamples;
+    
+    // Reserve space if needed (avoid frequent reallocations)
+    if (workingInputBuffer.capacity() < totalInputSamples) {
+        workingInputBuffer.reserve(totalInputSamples * 2);  // Reserve extra for future growth
+        printf("[*] Input buffer capacity increased to %zu samples\n", workingInputBuffer.capacity());
+    }
+    
+    // Efficiently prepare input data
+    workingInputBuffer.clear();
+    workingInputBuffer.insert(workingInputBuffer.end(), previousTail.begin(), previousTail.end());
+    workingInputBuffer.insert(workingInputBuffer.end(), input, input + inSamples);
 
-    const uint32_t fullInSamples = static_cast<uint32_t>(fullInput.size());
+    const uint32_t fullInSamples = static_cast<uint32_t>(workingInputBuffer.size());
     const uint32_t fullInFrames = fullInSamples / numChannels;
 
     // Calculate buffer requirements
@@ -100,7 +118,7 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
 
     // GPU processing pipeline
     if (!createBuffers(maxExpectedInFrames)) return false;
-    if (!uploadInputToGPU(fullInput.data(), fullInSamples)) return false;
+    if (!uploadInputToGPU(workingInputBuffer.data(), fullInSamples)) return false;
     
     if (computePipeline == VK_NULL_HANDLE) {
         if (!createPipeline(shaderModule)) return false;
@@ -114,24 +132,30 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
     
     if (!dispatch(fullInSamples, actualOutSamples)) return false;
 
-    // Download and process results
-    std::vector<float> fullOutput(actualOutSamples);
-    if (!downloadOutputFromGPU(fullOutput.data(), actualOutSamples)) return false;
+    // === Optimized output buffer management ===
+    // Reserve space for output if needed
+    if (workingOutputBuffer.capacity() < actualOutSamples) {
+        workingOutputBuffer.reserve(actualOutSamples * 2);  // Reserve extra for future growth
+        printf("[*] Output buffer capacity increased to %zu samples\n", workingOutputBuffer.capacity());
+    }
+    
+    workingOutputBuffer.resize(actualOutSamples);
+    if (!downloadOutputFromGPU(workingOutputBuffer.data(), actualOutSamples)) return false;
 
     // Calculate output offset based on tail processing
     const float tailFramesF = static_cast<float>(previousTail.size()) / numChannels;
     const float skipFramesF = tailFramesF * ratio;
     const uint32_t skipOffset = static_cast<uint32_t>(skipFramesF * numChannels);
 
-    if (skipOffset > fullOutput.size()) [[unlikely]] {
+    if (skipOffset > workingOutputBuffer.size()) [[unlikely]] {
         printf("[!] Output calculation error: skip=%u > total=%zu\n",
-            skipOffset, fullOutput.size());
+            skipOffset, workingOutputBuffer.size());
         return false;
     }
 
     // Copy final output
-    const uint32_t outCopyCount = static_cast<uint32_t>(fullOutput.size()) - skipOffset;
-    std::memcpy(output, fullOutput.data() + skipOffset, outCopyCount * sizeof(float));
+    const uint32_t outCopyCount = static_cast<uint32_t>(workingOutputBuffer.size()) - skipOffset;
+    std::memcpy(output, workingOutputBuffer.data() + skipOffset, outCopyCount * sizeof(float));
     outputFrames = outCopyCount / numChannels;
 
     // Update tail buffer for next iteration

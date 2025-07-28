@@ -96,8 +96,16 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
     const float ratio = static_cast<float>(outRate) / inRate;
     const uint32_t inSamples = inputFrames * numChannels;
 
-    // === Optimized input buffer management ===
-    const uint32_t totalInputSamples = previousTail.size() + inSamples;
+    // === Safe size conversion ===
+    const size_t tailSize = previousTail.size();
+    
+    // Size check (prevent 32-bit overflow)
+    if (tailSize > UINT32_MAX || inSamples > UINT32_MAX - tailSize) [[unlikely]] {
+        printf("[!] Buffer size exceeds 32-bit limit: tail=%zu, input=%u\n", tailSize, inSamples);
+        return false;
+    }
+    
+    const uint32_t totalInputSamples = static_cast<uint32_t>(tailSize) + inSamples;
     
     // Reserve space if needed (avoid frequent reallocations)
     if (workingInputBuffer.capacity() < totalInputSamples) {
@@ -110,7 +118,14 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
     workingInputBuffer.insert(workingInputBuffer.end(), previousTail.begin(), previousTail.end());
     workingInputBuffer.insert(workingInputBuffer.end(), input, input + inSamples);
 
-    const uint32_t fullInSamples = static_cast<uint32_t>(workingInputBuffer.size());
+    // === Safe size conversion (workingInputBuffer.size()) ===
+    const size_t bufferSize = workingInputBuffer.size();
+    if (bufferSize > UINT32_MAX) [[unlikely]] {
+        printf("[!] Working buffer size exceeds 32-bit limit: %zu\n", bufferSize);
+        return false;
+    }
+    
+    const uint32_t fullInSamples = static_cast<uint32_t>(bufferSize);
     const uint32_t fullInFrames = fullInSamples / numChannels;
 
     // Calculate buffer requirements
@@ -143,18 +158,24 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
     if (!downloadOutputFromGPU(workingOutputBuffer.data(), actualOutSamples)) return false;
 
     // Calculate output offset based on tail processing
-    const float tailFramesF = static_cast<float>(previousTail.size()) / numChannels;
+    const float tailFramesF = static_cast<float>(tailSize) / numChannels;  // Modified: previousTail.size() -> tailSize
     const float skipFramesF = tailFramesF * ratio;
     const uint32_t skipOffset = static_cast<uint32_t>(skipFramesF * numChannels);
 
-    if (skipOffset > workingOutputBuffer.size()) [[unlikely]] {
-        printf("[!] Output calculation error: skip=%u > total=%zu\n",
-            skipOffset, workingOutputBuffer.size());
+    // === Safe size conversion (workingOutputBuffer.size()) ===
+    const size_t outputSize = workingOutputBuffer.size();
+    if (skipOffset > outputSize) [[unlikely]] {
+        printf("[!] Output calculation error: skip=%u > total=%zu\n", skipOffset, outputSize);
         return false;
     }
 
-    // Copy final output
-    const uint32_t outCopyCount = static_cast<uint32_t>(workingOutputBuffer.size()) - skipOffset;
+    // Copy final output - Safe conversion
+    if (outputSize > UINT32_MAX) [[unlikely]] {
+        printf("[!] Output buffer size exceeds 32-bit limit: %zu\n", outputSize);
+        return false;
+    }
+    
+    const uint32_t outCopyCount = static_cast<uint32_t>(outputSize) - skipOffset;
     std::memcpy(output, workingOutputBuffer.data() + skipOffset, outCopyCount * sizeof(float));
     outputFrames = outCopyCount / numChannels;
 
@@ -636,14 +657,12 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
     // === Wait for previous frame completion and reset fence ===
     VkResult fenceStatus = vkGetFenceStatus(device, persistentFence);
     if (fenceStatus == VK_NOT_READY) {
-        // Previous frame still processing, wait for it
         if (vkWaitForFences(device, 1, &persistentFence, VK_TRUE, VulkanConfig::FENCE_TIMEOUT) != VK_SUCCESS) {
             printf("[!] Failed to wait for previous frame\n");
             return false;
         }
     }
     
-    // Reset fence for this frame
     vkResetFences(device, 1, &persistentFence);
 
     // === Record command buffer ===
@@ -651,7 +670,7 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
 
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;  // Optimization hint
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
     if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
         printf("[!] Failed to begin command buffer\n");
@@ -670,6 +689,17 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
 
     vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
 
+    // === Add input data preparation barrier ===
+    VkMemoryBarrier inputBarrier{};
+    inputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    inputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;        // CPU data upload completed
+    inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;       // GPU shader starts reading data
+
+    vkCmdPipelineBarrier(commandBuffer, 
+                        VK_PIPELINE_STAGE_HOST_BIT,               // After CPU work completion
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,     // Before compute shader start
+                        0, 1, &inputBarrier, 0, nullptr, 0, nullptr);
+
     // Calculate dispatch parameters
     const uint32_t totalSampleThreads = outSamples;
     const uint32_t groupCount = (totalSampleThreads + VulkanConfig::WORKGROUP_SIZE - 1) / VulkanConfig::WORKGROUP_SIZE;
@@ -677,16 +707,16 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
     // Dispatch compute work
     vkCmdDispatch(commandBuffer, groupCount, 1, 1);
 
-    // Add memory barrier for better GPU scheduling
-    VkMemoryBarrier memoryBarrier{};
-    memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    memoryBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    // === Improved output data preparation barrier ===
+    VkMemoryBarrier outputBarrier{};
+    outputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    outputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;     // GPU shader data write completed
+    outputBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;        // CPU starts reading data
 
     vkCmdPipelineBarrier(commandBuffer,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,     // After compute shader completion
+                        VK_PIPELINE_STAGE_HOST_BIT,               // Before CPU read start
+                        0, 1, &outputBarrier, 0, nullptr, 0, nullptr);
 
     if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
         printf("[!] Failed to record command buffer\n");

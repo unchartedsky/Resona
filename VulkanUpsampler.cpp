@@ -30,6 +30,16 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
         return false;
     }
 
+    // === Create persistent fence for reuse ===
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;  // Start in signaled state
+    
+    if (vkCreateFence(device, &fenceInfo, nullptr, &persistentFence) != VK_SUCCESS) {
+        printf("[!] Failed to create persistent fence\n");
+        return false;
+    }
+
     printf("[+] VulkanUpsampler initialized: %uHz -> %uHz (%u channels)\n", 
            inputRate, outputRate, channels);
     return true;
@@ -131,6 +141,13 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
 }
 
 void VulkanUpsampler::shutdown() {
+    // Wait for any pending GPU work and cleanup persistent fence
+    if (persistentFence != VK_NULL_HANDLE) {
+        vkWaitForFences(device, 1, &persistentFence, VK_TRUE, UINT64_MAX);
+        vkDestroyFence(device, persistentFence, nullptr);
+        persistentFence = VK_NULL_HANDLE;
+    }
+    
     cleanupPipeline();
     cleanupBuffers();
     cleanupVulkan();
@@ -592,11 +609,25 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
         return false;
     }
 
-    // Reset and begin command buffer
+    // === Wait for previous frame completion and reset fence ===
+    VkResult fenceStatus = vkGetFenceStatus(device, persistentFence);
+    if (fenceStatus == VK_NOT_READY) {
+        // Previous frame still processing, wait for it
+        if (vkWaitForFences(device, 1, &persistentFence, VK_TRUE, VulkanConfig::FENCE_TIMEOUT) != VK_SUCCESS) {
+            printf("[!] Failed to wait for previous frame\n");
+            return false;
+        }
+    }
+    
+    // Reset fence for this frame
+    vkResetFences(device, 1, &persistentFence);
+
+    // === Record command buffer ===
     vkResetCommandBuffer(commandBuffer, 0);
 
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;  // Optimization hint
 
     if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
         printf("[!] Failed to begin command buffer\n");
@@ -622,36 +653,35 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
     // Dispatch compute work
     vkCmdDispatch(commandBuffer, groupCount, 1, 1);
 
+    // Add memory barrier for better GPU scheduling
+    VkMemoryBarrier memoryBarrier{};
+    memoryBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    memoryBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+    vkCmdPipelineBarrier(commandBuffer,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        0, 1, &memoryBarrier, 0, nullptr, 0, nullptr);
+
     if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
         printf("[!] Failed to record command buffer\n");
         return false;
     }
 
-    // Create fence for synchronization
-    VkFenceCreateInfo fenceInfo{};
-    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    
-    VkFence fence;
-    if (vkCreateFence(device, &fenceInfo, nullptr, &fence) != VK_SUCCESS) {
-        printf("[!] Failed to create execution fence\n");
-        return false;
-    }
-
-    // Submit command buffer
+    // === Submit with persistent fence ===
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
 
-    if (vkQueueSubmit(computeQueue, 1, &submitInfo, fence) != VK_SUCCESS) {
+    if (vkQueueSubmit(computeQueue, 1, &submitInfo, persistentFence) != VK_SUCCESS) {
         printf("[!] Failed to submit command buffer\n");
-        vkDestroyFence(device, fence, nullptr);
         return false;
     }
 
-    // Wait for completion
-    const VkResult waitResult = vkWaitForFences(device, 1, &fence, VK_TRUE, VulkanConfig::FENCE_TIMEOUT);
-    vkDestroyFence(device, fence, nullptr);
+    // === Wait for completion ===
+    const VkResult waitResult = vkWaitForFences(device, 1, &persistentFence, VK_TRUE, VulkanConfig::FENCE_TIMEOUT);
 
     if (waitResult != VK_SUCCESS) {
         printf("[!] GPU execution timeout or error\n");

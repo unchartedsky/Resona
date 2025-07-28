@@ -129,4 +129,5 @@ private:
     VkPipeline computePipeline = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    VkFence persistentFence = VK_NULL_HANDLE;  ///< Reusable fence for GPU synchronization
 };

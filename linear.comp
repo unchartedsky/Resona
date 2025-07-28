@@ -22,26 +22,20 @@ void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= pc.outFrameCount * 2) return;
 
-    uint channel = 1 - (gid & 1); // 0 = R, 1 = L
+    uint channel = 1 - (gid & 1); // 0 = R, 1 = L (inverted because input is R0,L0,R1,L1 not L0,R0,L1,R1)
     uint outFrameIndex = gid >> 1;
 
     float inFrameIndex = float(outFrameIndex) / pc.ratio;
     uint baseFrame = uint(inFrameIndex);
     float frac = inFrameIndex - float(baseFrame);
 
-    // If we're out of bounds, clamp to last valid sample
-    if (baseFrame + 1 >= pc.inFrameCount) {
-        uint baseIndex = baseFrame * 2 + channel;
-        float s0 = (baseIndex < pc.inFrameCount * 2) ? inSamples[baseIndex] : 0.0;
-        outSamples[gid] = max(-1.0, min(1.0, s0));
-        return;
-    }
-
+    uint maxSampleIndex = pc.inFrameCount * 2;
     uint baseIndex = baseFrame * 2 + channel;
     uint nextIndex = baseIndex + 2;
 
-    float s0 = inSamples[baseIndex];
-    float s1 = (nextIndex < pc.inFrameCount * 2) ? inSamples[nextIndex] : s0;
+    // Combined boundary checks for current and next samples
+    float s0 = (baseIndex < maxSampleIndex) ? inSamples[baseIndex] : 0.0;
+    float s1 = (nextIndex < maxSampleIndex) ? inSamples[nextIndex] : s0;
 
     // Linear interpolation with clamp for safety
     float mixed = fma(frac, s1 - s0, s0);

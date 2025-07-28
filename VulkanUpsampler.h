@@ -34,6 +34,12 @@ private:
     /// @brief Clean up buffer and memory objects  
     void cleanupBuffers();
 
+    // === Vulkan Initialization Functions ===
+    bool createInstance();
+    bool selectPhysicalDevice(); 
+    bool createLogicalDevice();
+    bool createCommandObjects();
+
     // === Resource Management ===
     
     /// @brief Create input/output buffers for given frame count
@@ -46,6 +52,10 @@ private:
     /// @brief Create compute pipeline with given shader
     /// @param shaderModule Compiled shader module
     bool createPipeline(VkShaderModule shaderModule);
+
+    // === Buffer Management Functions ===
+    bool createBuffer(VkDeviceSize size, VkBuffer& buffer, VkDeviceMemory& memory, void** mappedPtr, const char* label);
+    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
     
     // === Data Transfer ===
     
@@ -63,6 +73,9 @@ private:
     /// @param inSamples Input sample count
     /// @param outSamples Output sample count  
     bool dispatch(uint32_t inSamples, uint32_t outSamples);
+
+    // === Utility Functions ===
+    void updateTailBuffer(const float* input, uint32_t inSamples);
 
     // === Constants ===
     static constexpr uint32_t DEFAULT_CHANNELS = 2;

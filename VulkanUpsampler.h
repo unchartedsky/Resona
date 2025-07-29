@@ -20,6 +20,12 @@ public:
     VkShaderModule createShaderModule(const std::string& filename);
 
 private:
+    // add state tracking for optimization
+    bool descriptorSetNeedsUpdate = true;
+    bool buffersChanged = false;
+    VkDeviceSize lastInputBufferSize = 0;
+    VkDeviceSize lastOutputBufferSize = 0;
+
     // === Initialization and Cleanup ===
     
     /// @brief Initialize Vulkan instance, device, and command objects

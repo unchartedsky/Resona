@@ -395,6 +395,11 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
 
     maxInputFrames = inputFrames;
     maxOutputSamples = totalOutputSamples;
+    
+    // Optimization: Set buffer changed flag
+    descriptorSetNeedsUpdate = true;
+    lastInputBufferSize = inputSize;
+    lastOutputBufferSize = outputSize;
 
     printf("[+] GPU buffers created: input=%.1f KB, output=%.1f KB (frames=%u)\n",
         inputSize / 1024.0, outputSize / 1024.0, inputFrames);
@@ -615,36 +620,41 @@ bool VulkanUpsampler::createDescriptorSet() {
             printf("[!] Failed to allocate descriptor set\n");
             return false;
         }
+        descriptorSetNeedsUpdate = true;  // Update needed when newly created
     }
 
-    // Update descriptor set with current buffer bindings
-    VkDescriptorBufferInfo inputInfo{};
-    inputInfo.buffer = inputBuffer;
-    inputInfo.offset = 0;
-    inputInfo.range = VK_WHOLE_SIZE;
+    // Optimization: Update only when buffers have changed
+    if (descriptorSetNeedsUpdate) {
+        VkDescriptorBufferInfo inputInfo{};
+        inputInfo.buffer = inputBuffer;
+        inputInfo.offset = 0;
+        inputInfo.range = VK_WHOLE_SIZE;
 
-    VkDescriptorBufferInfo outputInfo{};
-    outputInfo.buffer = outputBuffer;
-    outputInfo.offset = 0;
-    outputInfo.range = VK_WHOLE_SIZE;
+        VkDescriptorBufferInfo outputInfo{};
+        outputInfo.buffer = outputBuffer;
+        outputInfo.offset = 0;
+        outputInfo.range = VK_WHOLE_SIZE;
 
-    VkWriteDescriptorSet writes[2]{};
+        VkWriteDescriptorSet writes[2]{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = descriptorSet;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[0].pBufferInfo = &inputInfo;
 
-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = descriptorSet;
-    writes[0].dstBinding = 0;
-    writes[0].descriptorCount = 1;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[0].pBufferInfo = &inputInfo;
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = descriptorSet;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &outputInfo;
 
-    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = descriptorSet;
-    writes[1].dstBinding = 1;
-    writes[1].descriptorCount = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[1].pBufferInfo = &outputInfo;
+        vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+        descriptorSetNeedsUpdate = false;  // Update completed
+        printf("[*] Descriptor set updated\n");
+    }
 
-    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
     return true;
 }
 

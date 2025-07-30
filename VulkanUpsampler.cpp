@@ -316,7 +316,9 @@ bool VulkanUpsampler::createCommandObjects() {
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.queueFamilyIndex = computeQueueFamily;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    
+    // Flag change for pool reset optimization
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;  // For short-lived command buffers
 
     if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS) {
         printf("[!] Failed to create command pool\n");
@@ -675,8 +677,13 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
     
     vkResetFences(device, 1, &persistentFence);
 
+    // Pool reset optimization: Reset entire pool (resets all command buffers at once)
+    if (vkResetCommandPool(device, commandPool, 0) != VK_SUCCESS) {
+        printf("[!] Failed to reset command pool\n");
+        return false;
+    }
+
     // === Record command buffer ===
-    vkResetCommandBuffer(commandBuffer, 0);
 
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -699,15 +706,15 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
 
     vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
 
-    // === Add input data preparation barrier ===
+    // === Memory barriers ===
     VkMemoryBarrier inputBarrier{};
     inputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    inputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;        // CPU data upload completed
-    inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;       // GPU shader starts reading data
+    inputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
     vkCmdPipelineBarrier(commandBuffer, 
-                        VK_PIPELINE_STAGE_HOST_BIT,               // After CPU work completion
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,     // Before compute shader start
+                        VK_PIPELINE_STAGE_HOST_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         0, 1, &inputBarrier, 0, nullptr, 0, nullptr);
 
     // Calculate dispatch parameters
@@ -717,15 +724,15 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
     // Dispatch compute work
     vkCmdDispatch(commandBuffer, groupCount, 1, 1);
 
-    // === Improved output data preparation barrier ===
+    // Output barrier
     VkMemoryBarrier outputBarrier{};
     outputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    outputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;     // GPU shader data write completed
-    outputBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;        // CPU starts reading data
+    outputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    outputBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
 
     vkCmdPipelineBarrier(commandBuffer,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,     // After compute shader completion
-                        VK_PIPELINE_STAGE_HOST_BIT,               // Before CPU read start
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_PIPELINE_STAGE_HOST_BIT,
                         0, 1, &outputBarrier, 0, nullptr, 0, nullptr);
 
     if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
@@ -733,7 +740,7 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
         return false;
     }
 
-    // === Submit with persistent fence ===
+    // === Submit and wait ===
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
@@ -744,9 +751,7 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
         return false;
     }
 
-    // === Wait for completion ===
     const VkResult waitResult = vkWaitForFences(device, 1, &persistentFence, VK_TRUE, VulkanConfig::FENCE_TIMEOUT);
-
     if (waitResult != VK_SUCCESS) {
         printf("[!] GPU execution timeout or error\n");
         return false;

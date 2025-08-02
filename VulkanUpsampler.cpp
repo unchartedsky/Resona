@@ -30,15 +30,38 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
         return false;
     }
 
-    // === Create persistent fence for reuse ===
-    VkFenceCreateInfo fenceInfo{};
-    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;  // Start in signaled state
-    
-    if (vkCreateFence(device, &fenceInfo, nullptr, &persistentFence) != VK_SUCCESS) {
-        printf("[!] Failed to create persistent fence\n");
+    // === Allocate single GpuSlot ===
+    VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    if (vkCreateFence(device, &fenceInfo, nullptr, &slot.fence) != VK_SUCCESS) {
+        printf("[!] Failed to create slot fence\n");
         return false;
     }
+
+    // Allocate command buffer for slot
+    VkCommandBufferAllocateInfo cmdAlloc{};
+    cmdAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmdAlloc.commandPool = commandPool;
+    cmdAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAlloc.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(device, &cmdAlloc, &slot.commandBuffer) != VK_SUCCESS) {
+        printf("[!] Failed to allocate slot command buffer\n");
+        return false;
+    }
+
+    // Allocate input buffer
+    VkDeviceSize inputSize = 4096 * sizeof(float); // conservative
+    if (!createBuffer(inputSize, slot.inputBuffer, slot.inputMemory, &slot.inputPtr, "slot.input")) {
+        return false;
+    }
+
+    // Allocate output buffer
+    VkDeviceSize outputSize = 8192 * sizeof(float); // conservative
+    if (!createBuffer(outputSize, slot.outputBuffer, slot.outputMemory, &slot.outputPtr, "slot.output")) {
+        return false;
+    }
+
+    slot.initialized = true;
 
     // === Pre-allocate working buffers based on expected usage ===
     const float ratio = static_cast<float>(outputRate) / inputRate;
@@ -52,6 +75,7 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
            inputRate, outputRate, channels);
     printf("[*] Pre-allocated buffers: input=%zu, output=%zu samples\n",
            workingInputBuffer.capacity(), workingOutputBuffer.capacity());
+
     return true;
 }
 
@@ -661,99 +685,107 @@ bool VulkanUpsampler::createDescriptorSet() {
 }
 
 bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
+    if (!slot.initialized) {
+        printf("[!] GpuSlot not initialized\n");
+        return false;
+    }
+
     if (computePipeline == VK_NULL_HANDLE || pipelineLayout == VK_NULL_HANDLE) [[unlikely]] {
         printf("[!] Pipeline not ready for dispatch\n");
         return false;
     }
 
-    // === Wait for previous frame completion and reset fence ===
-    VkResult fenceStatus = vkGetFenceStatus(device, persistentFence);
+    // === Wait for previous work to complete ===
+    VkResult fenceStatus = vkGetFenceStatus(device, slot.fence);
     if (fenceStatus == VK_NOT_READY) {
-        if (vkWaitForFences(device, 1, &persistentFence, VK_TRUE, VulkanConfig::FENCE_TIMEOUT) != VK_SUCCESS) {
-            printf("[!] Failed to wait for previous frame\n");
+        if (vkWaitForFences(device, 1, &slot.fence, VK_TRUE, VulkanConfig::FENCE_TIMEOUT) != VK_SUCCESS) {
+            printf("[!] Failed to wait for previous GPU work\n");
             return false;
         }
     }
-    
-    vkResetFences(device, 1, &persistentFence);
 
-    // Pool reset optimization: Reset entire pool (resets all command buffers at once)
-    if (vkResetCommandPool(device, commandPool, 0) != VK_SUCCESS) {
-        printf("[!] Failed to reset command pool\n");
+    vkResetFences(device, 1, &slot.fence);
+
+    // === Reset command buffer ===
+    if (vkResetCommandBuffer(slot.commandBuffer, 0) != VK_SUCCESS) {
+        printf("[!] Failed to reset command buffer\n");
         return false;
     }
 
-    // === Record command buffer ===
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
-    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
+    if (vkBeginCommandBuffer(slot.commandBuffer, &beginInfo) != VK_SUCCESS) {
         printf("[!] Failed to begin command buffer\n");
         return false;
     }
 
-    // Bind pipeline and descriptor sets
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+    // === Record compute commands ===
+    vkCmdBindPipeline(slot.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
+    vkCmdBindDescriptorSets(slot.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
 
-    // Set push constants
-    PushConstants pushConstants{};
-    pushConstants.inFrameCount = inSamples / numChannels;
-    pushConstants.outFrameCount = outSamples / numChannels;
-    pushConstants.ratio = static_cast<float>(static_cast<double>(outRate) / inRate);
+    PushConstants push{};
+    push.inFrameCount = inSamples / numChannels;
+    push.outFrameCount = outSamples / numChannels;
+    push.ratio = static_cast<float>(static_cast<double>(outRate) / inRate);
 
-    vkCmdPushConstants(commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pushConstants), &pushConstants);
+    vkCmdPushConstants(slot.commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &push);
 
-    // === Memory barriers ===
-    VkMemoryBarrier inputBarrier{};
-    inputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    // Memory barrier for input buffer
+    VkMemoryBarrier inputBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     inputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
     inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
-    vkCmdPipelineBarrier(commandBuffer, 
-                        VK_PIPELINE_STAGE_HOST_BIT,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        0, 1, &inputBarrier, 0, nullptr, 0, nullptr);
+    vkCmdPipelineBarrier(
+        slot.commandBuffer,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0,
+        1, &inputBarrier,
+        0, nullptr,
+        0, nullptr
+    );
 
-    // Calculate dispatch parameters
     const uint32_t totalSampleThreads = outSamples;
     const uint32_t groupCount = (totalSampleThreads + VulkanConfig::WORKGROUP_SIZE - 1) / VulkanConfig::WORKGROUP_SIZE;
 
-    // Dispatch compute work
-    vkCmdDispatch(commandBuffer, groupCount, 1, 1);
+    vkCmdDispatch(slot.commandBuffer, groupCount, 1, 1);
 
-    // Output barrier
-    VkMemoryBarrier outputBarrier{};
-    outputBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    // Memory barrier for output buffer
+    VkMemoryBarrier outputBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     outputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     outputBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
 
-    vkCmdPipelineBarrier(commandBuffer,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        VK_PIPELINE_STAGE_HOST_BIT,
-                        0, 1, &outputBarrier, 0, nullptr, 0, nullptr);
+    vkCmdPipelineBarrier(
+        slot.commandBuffer,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_HOST_BIT,
+        0,
+        1, &outputBarrier,
+        0, nullptr,
+        0, nullptr
+    );
 
-    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
+    if (vkEndCommandBuffer(slot.commandBuffer) != VK_SUCCESS) {
         printf("[!] Failed to record command buffer\n");
         return false;
     }
 
-    // === Submit and wait ===
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &commandBuffer;
+    // === Submit ===
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &slot.commandBuffer;
 
-    if (vkQueueSubmit(computeQueue, 1, &submitInfo, persistentFence) != VK_SUCCESS) {
-        printf("[!] Failed to submit command buffer\n");
+    if (vkQueueSubmit(computeQueue, 1, &submit, slot.fence) != VK_SUCCESS) {
+        printf("[!] Failed to submit compute work\n");
         return false;
     }
 
-    const VkResult waitResult = vkWaitForFences(device, 1, &persistentFence, VK_TRUE, VulkanConfig::FENCE_TIMEOUT);
+    // === Wait (synchronous) ===
+    const VkResult waitResult = vkWaitForFences(device, 1, &slot.fence, VK_TRUE, VulkanConfig::FENCE_TIMEOUT);
     if (waitResult != VK_SUCCESS) {
-        printf("[!] GPU execution timeout or error\n");
+        printf("[!] GPU dispatch timeout or error\n");
         return false;
     }
 

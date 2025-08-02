@@ -4,6 +4,20 @@
 #include <string>
 #include <vector>
 
+struct GpuSlot {
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkBuffer inputBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory inputMemory = VK_NULL_HANDLE;
+    void* inputPtr = nullptr;
+
+    VkBuffer outputBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory outputMemory = VK_NULL_HANDLE;
+    void* outputPtr = nullptr;
+
+    bool initialized = false;
+};
+
 /**
  * @brief Vulkan-based GPU audio upsampler implementation.
  */
@@ -140,4 +154,6 @@ private:
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
     VkFence persistentFence = VK_NULL_HANDLE;  ///< Reusable fence for GPU synchronization
+
+    GpuSlot slot;
 };

@@ -51,8 +51,9 @@ private:
     /// @brief Clean up compute pipeline objects
     void cleanupPipeline();
     
-    /// @brief Clean up buffer and memory objects  
-    void cleanupBuffers();
+    void cleanupGpuSlot(GpuSlot& cleanupSlot);
+
+    void cleanupSlotBuffers(GpuSlot& slotRef);
 
     // === Vulkan Initialization Functions ===
     bool createInstance();
@@ -116,8 +117,6 @@ private:
     uint32_t inRate = 0;
     uint32_t outRate = 0;
     uint32_t numChannels = DEFAULT_CHANNELS;
-    uint32_t maxInputFrames = 0;
-    uint32_t maxOutputSamples = 0;
     std::vector<float> previousTail;
 
     // === Performance Buffers ===
@@ -125,8 +124,6 @@ private:
     std::vector<float> workingOutputBuffer;  ///< Reusable buffer for output processing
 
     // === Memory Management ===
-    void* inputMappedPtr = nullptr;
-    void* outputMappedPtr = nullptr;
     VkMemoryPropertyFlags inputMemoryProperties = BUFFER_MEMORY_PROPS;
     VkMemoryPropertyFlags outputMemoryProperties = BUFFER_MEMORY_PROPS;
 
@@ -138,13 +135,6 @@ private:
 
     // === Command Objects ===
     VkCommandPool commandPool = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-
-    // === Buffer Objects ===
-    VkBuffer inputBuffer = VK_NULL_HANDLE;
-    VkBuffer outputBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory inputMemory = VK_NULL_HANDLE;
-    VkDeviceMemory outputMemory = VK_NULL_HANDLE;
 
     // === Pipeline Objects ===
     VkShaderModule shaderModule = VK_NULL_HANDLE;
@@ -153,7 +143,6 @@ private:
     VkPipeline computePipeline = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
-    VkFence persistentFence = VK_NULL_HANDLE;  ///< Reusable fence for GPU synchronization
 
     GpuSlot slot;
 };

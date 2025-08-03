@@ -210,16 +210,13 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
 }
 
 void VulkanUpsampler::shutdown() {
-    // Wait for any pending GPU work and cleanup persistent fence
-    if (persistentFence != VK_NULL_HANDLE) {
-        vkWaitForFences(device, 1, &persistentFence, VK_TRUE, UINT64_MAX);
-        vkDestroyFence(device, persistentFence, nullptr);
-        persistentFence = VK_NULL_HANDLE;
+    if (slot.initialized) {
+        cleanupGpuSlot(slot);
     }
-    
+
     cleanupPipeline();
-    cleanupBuffers();
     cleanupVulkan();
+    
     printf("[+] VulkanUpsampler shutdown complete\n");
 }
 
@@ -356,7 +353,7 @@ bool VulkanUpsampler::createCommandObjects() {
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocInfo.commandBufferCount = 1;
 
-    if (vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer) != VK_SUCCESS) {
+    if (vkAllocateCommandBuffers(device, &allocInfo, &slot.commandBuffer) != VK_SUCCESS) {
         printf("[!] Failed to allocate command buffer\n");
         return false;
     }
@@ -397,38 +394,34 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
     const uint32_t totalInputSamples = inputFrames * numChannels;
     const uint32_t totalOutputSamples = static_cast<uint32_t>(inputFrames * (static_cast<float>(outRate) / inRate)) * numChannels;
 
-    // Check if current buffers are sufficient
-    if (inputFrames <= maxInputFrames && totalOutputSamples <= maxOutputSamples) {
-        return true;
+    const VkDeviceSize requiredInputSize = sizeof(float) * totalInputSamples;
+    const VkDeviceSize requiredOutputSize = sizeof(float) * totalOutputSamples;
+
+    // Check if resize is necessary
+    bool needsResize = false;
+    if (requiredInputSize > lastInputBufferSize) {
+        lastInputBufferSize = requiredInputSize;
+        needsResize = true;
+    }
+    if (requiredOutputSize > lastOutputBufferSize) {
+        lastOutputBufferSize = requiredOutputSize;
+        needsResize = true;
     }
 
-    // Clean up existing buffers
-    cleanupBuffers();
-
-    const VkDeviceSize inputSize = sizeof(float) * totalInputSamples;
-    const VkDeviceSize outputSize = sizeof(float) * totalOutputSamples;
-
-    // Create input buffer
-    if (!createBuffer(inputSize, inputBuffer, inputMemory, &inputMappedPtr, "input")) {
-        return false;
+    if (!needsResize) {
+        return true; // Existing buffers are sufficient
     }
 
-    // Create output buffer
-    if (!createBuffer(outputSize, outputBuffer, outputMemory, &outputMappedPtr, "output")) {
-        cleanupBuffers();
-        return false;
-    }
+    // Only destroy slot buffer resources (not full slot)
+    cleanupSlotBuffers(slot);
 
-    maxInputFrames = inputFrames;
-    maxOutputSamples = totalOutputSamples;
-    
-    // Optimization: Set buffer changed flag
+    if (!createBuffer(lastInputBufferSize, slot.inputBuffer, slot.inputMemory, &slot.inputPtr, "input")) return false;
+    if (!createBuffer(lastOutputBufferSize, slot.outputBuffer, slot.outputMemory, &slot.outputPtr, "output")) return false;
+
     descriptorSetNeedsUpdate = true;
-    lastInputBufferSize = inputSize;
-    lastOutputBufferSize = outputSize;
 
     printf("[+] GPU buffers created: input=%.1f KB, output=%.1f KB (frames=%u)\n",
-        inputSize / 1024.0, outputSize / 1024.0, inputFrames);
+        requiredInputSize / 1024.0, requiredOutputSize / 1024.0, inputFrames);
 
     return true;
 }
@@ -518,19 +511,19 @@ uint32_t VulkanUpsampler::findMemoryType(uint32_t typeFilter, VkMemoryPropertyFl
 }
 
 bool VulkanUpsampler::uploadInputToGPU(const float* input, uint32_t totalSamples) {
-    if (!inputMappedPtr) [[unlikely]] {
+    if (!slot.inputPtr) [[unlikely]] {
         printf("[!] Input memory not mapped\n");
         return false;
     }
 
     const VkDeviceSize size = sizeof(float) * totalSamples;
-    std::memcpy(inputMappedPtr, input, size);
+    std::memcpy(slot.inputPtr, input, size);
 
     // Flush if memory is not coherent
     if (!(inputMemoryProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
         VkMappedMemoryRange flushRange{};
         flushRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-        flushRange.memory = inputMemory;
+        flushRange.memory = slot.inputMemory;
         flushRange.offset = 0;
         flushRange.size = size;
         
@@ -652,12 +645,12 @@ bool VulkanUpsampler::createDescriptorSet() {
     // Optimization: Update only when buffers have changed
     if (descriptorSetNeedsUpdate) {
         VkDescriptorBufferInfo inputInfo{};
-        inputInfo.buffer = inputBuffer;
+        inputInfo.buffer = slot.inputBuffer;
         inputInfo.offset = 0;
         inputInfo.range = VK_WHOLE_SIZE;
 
         VkDescriptorBufferInfo outputInfo{};
-        outputInfo.buffer = outputBuffer;
+        outputInfo.buffer = slot.outputBuffer;
         outputInfo.offset = 0;
         outputInfo.range = VK_WHOLE_SIZE;
 
@@ -793,7 +786,7 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
 }
 
 bool VulkanUpsampler::downloadOutputFromGPU(float* output, uint32_t totalSamples) {
-    if (!outputMappedPtr) [[unlikely]] {
+    if (!slot.outputPtr) [[unlikely]] {
         printf("[!] Output memory not mapped\n");
         return false;
     }
@@ -802,7 +795,7 @@ bool VulkanUpsampler::downloadOutputFromGPU(float* output, uint32_t totalSamples
     if (!(outputMemoryProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
         VkMappedMemoryRange range{};
         range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-        range.memory = outputMemory;
+        range.memory = slot.outputMemory;
         range.offset = 0;
         range.size = sizeof(float) * totalSamples;
 
@@ -812,7 +805,7 @@ bool VulkanUpsampler::downloadOutputFromGPU(float* output, uint32_t totalSamples
         }
     }
 
-    std::memcpy(output, outputMappedPtr, sizeof(float) * totalSamples);
+    std::memcpy(output, slot.outputPtr, sizeof(float) * totalSamples);
     return true;
 }
 
@@ -848,36 +841,6 @@ void VulkanUpsampler::cleanupPipeline() {
     }
 }
 
-void VulkanUpsampler::cleanupBuffers() {
-    if (inputMappedPtr) {
-        vkUnmapMemory(device, inputMemory);
-        inputMappedPtr = nullptr;
-    }
-    if (outputMappedPtr) {
-        vkUnmapMemory(device, outputMemory);
-        outputMappedPtr = nullptr;
-    }
-    if (inputBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device, inputBuffer, nullptr);
-        inputBuffer = VK_NULL_HANDLE;
-    }
-    if (outputBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(device, outputBuffer, nullptr);
-        outputBuffer = VK_NULL_HANDLE;
-    }
-    if (inputMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(device, inputMemory, nullptr);
-        inputMemory = VK_NULL_HANDLE;
-    }
-    if (outputMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(device, outputMemory, nullptr);
-        outputMemory = VK_NULL_HANDLE;
-    }
-    
-    maxInputFrames = 0;
-    maxOutputSamples = 0;
-}
-
 void VulkanUpsampler::cleanupVulkan() {
     if (shaderModule != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device, shaderModule, nullptr);
@@ -900,6 +863,73 @@ void VulkanUpsampler::cleanupVulkan() {
 
     // Reset all handles
     physicalDevice = VK_NULL_HANDLE;
-    commandBuffer = VK_NULL_HANDLE;
     computeQueue = VK_NULL_HANDLE;
+}
+
+void VulkanUpsampler::cleanupGpuSlot(GpuSlot& cleanupSlot) {
+    if (cleanupSlot.commandBuffer != VK_NULL_HANDLE) {
+        // Command buffer는 pool에서 일괄 해제됨 (생략 가능)
+        cleanupSlot.commandBuffer = VK_NULL_HANDLE;
+    }
+
+    if (cleanupSlot.fence != VK_NULL_HANDLE) {
+        vkDestroyFence(device, cleanupSlot.fence, nullptr);
+        cleanupSlot.fence = VK_NULL_HANDLE;
+    }
+
+    if (cleanupSlot.inputPtr) {
+        vkUnmapMemory(device, cleanupSlot.inputMemory);
+        cleanupSlot.inputPtr = nullptr;
+    }
+    if (cleanupSlot.inputBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device, cleanupSlot.inputBuffer, nullptr);
+        cleanupSlot.inputBuffer = VK_NULL_HANDLE;
+    }
+    if (cleanupSlot.inputMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, cleanupSlot.inputMemory, nullptr);
+        cleanupSlot.inputMemory = VK_NULL_HANDLE;
+    }
+
+    if (cleanupSlot.outputPtr) {
+        vkUnmapMemory(device, cleanupSlot.outputMemory);
+        cleanupSlot.outputPtr = nullptr;
+    }
+    if (cleanupSlot.outputBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device, cleanupSlot.outputBuffer, nullptr);
+        cleanupSlot.outputBuffer = VK_NULL_HANDLE;
+    }
+    if (cleanupSlot.outputMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, cleanupSlot.outputMemory, nullptr);
+        cleanupSlot.outputMemory = VK_NULL_HANDLE;
+    }
+
+    cleanupSlot.initialized = false;
+}
+
+void VulkanUpsampler::cleanupSlotBuffers(GpuSlot& slotRef) {
+    if (slotRef.inputPtr) {
+        vkUnmapMemory(device, slotRef.inputMemory);
+        slotRef.inputPtr = nullptr;
+    }
+    if (slotRef.inputBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device, slotRef.inputBuffer, nullptr);
+        slotRef.inputBuffer = VK_NULL_HANDLE;
+    }
+    if (slotRef.inputMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, slotRef.inputMemory, nullptr);
+        slotRef.inputMemory = VK_NULL_HANDLE;
+    }
+
+    if (slotRef.outputPtr) {
+        vkUnmapMemory(device, slotRef.outputMemory);
+        slotRef.outputPtr = nullptr;
+    }
+    if (slotRef.outputBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device, slotRef.outputBuffer, nullptr);
+        slotRef.outputBuffer = VK_NULL_HANDLE;
+    }
+    if (slotRef.outputMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, slotRef.outputMemory, nullptr);
+        slotRef.outputMemory = VK_NULL_HANDLE;
+    }
 }

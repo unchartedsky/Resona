@@ -868,7 +868,7 @@ void VulkanUpsampler::cleanupVulkan() {
 
 void VulkanUpsampler::cleanupGpuSlot(GpuSlot& cleanupSlot) {
     if (cleanupSlot.commandBuffer != VK_NULL_HANDLE) {
-        // Command buffer는 pool에서 일괄 해제됨 (생략 가능)
+        // Command buffers are freed automatically with the pool (can be omitted)
         cleanupSlot.commandBuffer = VK_NULL_HANDLE;
     }
 

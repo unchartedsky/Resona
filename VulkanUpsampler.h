@@ -7,6 +7,7 @@
 struct GpuSlot {
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
+
     VkBuffer inputBuffer = VK_NULL_HANDLE;
     VkDeviceMemory inputMemory = VK_NULL_HANDLE;
     void* inputPtr = nullptr;
@@ -15,7 +16,12 @@ struct GpuSlot {
     VkDeviceMemory outputMemory = VK_NULL_HANDLE;
     void* outputPtr = nullptr;
 
+    // async state
     bool initialized = false;
+    bool inFlight = false;
+    uint64_t sequenceId = 0;
+    uint32_t expectedOutSamples = 0;
+    uint32_t skipOffset = 0; // samples to skip due to tail
 };
 
 /**
@@ -26,6 +32,10 @@ public:
     bool initialize(uint32_t inputRate, uint32_t outputRate, uint32_t channels) override;
     void setKernel(ResampleKernel kernel) override;
     bool process(const float* input, uint32_t inputFrames, float* output, uint32_t& outputFrames) override;
+    // Perform submission only (no waiting). Returns true on successful submission, false if slot is busy
+    bool enqueue(const float* input, uint32_t inputFrames);
+    // Check completion status. If ready=false, it's not completed yet. If ready=true, write the order-guaranteed results to output and set outputFrames
+    bool poll(bool& ready, float* output, uint32_t& outputFrames);
     void shutdown() override;
 
     /// @brief Create shader module from SPIR-V bytecode file
@@ -34,12 +44,6 @@ public:
     VkShaderModule createShaderModule(const std::string& filename);
 
 private:
-    // add state tracking for optimization
-    bool descriptorSetNeedsUpdate = true;
-    bool buffersChanged = false;
-    VkDeviceSize lastInputBufferSize = 0;
-    VkDeviceSize lastOutputBufferSize = 0;
-
     // === Initialization and Cleanup ===
     
     /// @brief Initialize Vulkan instance, device, and command objects
@@ -50,10 +54,10 @@ private:
     
     /// @brief Clean up compute pipeline objects
     void cleanupPipeline();
-    
-    void cleanupGpuSlot(GpuSlot& cleanupSlot);
 
     void cleanupSlotBuffers(GpuSlot& slotRef);
+
+    void cleanupGpuSlot(GpuSlot& cleanupSlot);
 
     // === Vulkan Initialization Functions ===
     bool createInstance();
@@ -117,6 +121,7 @@ private:
     uint32_t inRate = 0;
     uint32_t outRate = 0;
     uint32_t numChannels = DEFAULT_CHANNELS;
+    
     std::vector<float> previousTail;
 
     // === Performance Buffers ===
@@ -143,6 +148,14 @@ private:
     VkPipeline computePipeline = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+
+    // add state tracking for optimization
+    bool descriptorSetNeedsUpdate = true;
+    VkDeviceSize lastInputBufferSize = 0;
+    VkDeviceSize lastOutputBufferSize = 0;
+
+    // async sequencing
+    uint64_t nextSequenceId = 0;
 
     GpuSlot slot;
 };

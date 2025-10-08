@@ -38,17 +38,6 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
         return false;
     }
 
-    // Allocate command buffer for slot
-    VkCommandBufferAllocateInfo cmdAlloc{};
-    cmdAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmdAlloc.commandPool = commandPool;
-    cmdAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmdAlloc.commandBufferCount = 1;
-    if (vkAllocateCommandBuffers(device, &cmdAlloc, &slot.commandBuffer) != VK_SUCCESS) {
-        printf("[!] Failed to allocate slot command buffer\n");
-        return false;
-    }
-
     // Allocate input buffer
     VkDeviceSize inputSize = 4096 * sizeof(float); // conservative
     if (!createBuffer(inputSize, slot.inputBuffer, slot.inputMemory, &slot.inputPtr, "slot.input")) {
@@ -62,10 +51,13 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
     }
 
     slot.initialized = true;
+    lastInputBufferSize = 4096 * sizeof(float);
+    lastOutputBufferSize = 8192 * sizeof(float);
+    descriptorSetNeedsUpdate = true;
 
     // === Pre-allocate working buffers based on expected usage ===
-    const float ratio = static_cast<float>(outputRate) / inputRate;
-    const uint32_t estimatedInputSamples = 2048 * channels;  // Typical frame size
+    const float ratio = static_cast<float>(outRate) / inRate;
+    const uint32_t estimatedInputSamples = 2048 * numChannels;  // Typical frame size
     const uint32_t estimatedOutputSamples = static_cast<uint32_t>(estimatedInputSamples * ratio);
     
     workingInputBuffer.reserve(estimatedInputSamples * 2);   // Extra headroom
@@ -336,8 +328,7 @@ bool VulkanUpsampler::createCommandObjects() {
     // Create command pool
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.queueFamilyIndex = computeQueueFamily;
-    
+    poolInfo.queueFamilyIndex = computeQueueFamily; 
     // Flag change for pool reset optimization
     poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;  // For short-lived command buffers
 
@@ -391,8 +382,9 @@ VkShaderModule VulkanUpsampler::createShaderModule(const std::string& filename) 
 }
 
 bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
+    const float ratio = static_cast<float>(outRate) / inRate;
     const uint32_t totalInputSamples = inputFrames * numChannels;
-    const uint32_t totalOutputSamples = static_cast<uint32_t>(inputFrames * (static_cast<float>(outRate) / inRate)) * numChannels;
+    const uint32_t totalOutputSamples = static_cast<uint32_t>(inputFrames * ratio) * numChannels;
 
     const VkDeviceSize requiredInputSize = sizeof(float) * totalInputSamples;
     const VkDeviceSize requiredOutputSize = sizeof(float) * totalOutputSamples;
@@ -414,7 +406,6 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
 
     // Only destroy slot buffer resources (not full slot)
     cleanupSlotBuffers(slot);
-
     if (!createBuffer(lastInputBufferSize, slot.inputBuffer, slot.inputMemory, &slot.inputPtr, "input")) return false;
     if (!createBuffer(lastOutputBufferSize, slot.outputBuffer, slot.outputMemory, &slot.outputPtr, "output")) return false;
 

@@ -6,6 +6,7 @@
 #include <vector>
 #include <stdexcept>
 #include <algorithm>
+#include <thread>
 
 // === Configuration Constants ===
 namespace VulkanConfig {
@@ -15,7 +16,7 @@ namespace VulkanConfig {
     static constexpr float QUEUE_PRIORITY = 1.0f;
     static constexpr const char* APP_NAME = "VulkanUpsampler";
     static constexpr const char* ENGINE_NAME = "No Engine";
-    static constexpr uint64_t FENCE_TIMEOUT = UINT64_MAX; // Infinite timeout
+    static constexpr uint64_t FENCE_TIMEOUT = UINT64_MAX;
 }
 
 // === Public Interface Implementation ===
@@ -30,7 +31,7 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
         return false;
     }
 
-    // === Allocate single GpuSlot ===
+    // Create fence for async synchronization
     VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     if (vkCreateFence(device, &fenceInfo, nullptr, &slot.fence) != VK_SUCCESS) {
@@ -38,35 +39,32 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
         return false;
     }
 
-    // Allocate input buffer
-    VkDeviceSize inputSize = 4096 * sizeof(float); // conservative
+    // Allocate initial GPU buffers
+    VkDeviceSize inputSize = 4096 * sizeof(float);
     if (!createBuffer(inputSize, slot.inputBuffer, slot.inputMemory, &slot.inputPtr, "slot.input")) {
         return false;
     }
 
-    // Allocate output buffer
-    VkDeviceSize outputSize = 8192 * sizeof(float); // conservative
+    VkDeviceSize outputSize = 8192 * sizeof(float);
     if (!createBuffer(outputSize, slot.outputBuffer, slot.outputMemory, &slot.outputPtr, "slot.output")) {
         return false;
     }
 
     slot.initialized = true;
-    lastInputBufferSize = 4096 * sizeof(float);
-    lastOutputBufferSize = 8192 * sizeof(float);
+    lastInputBufferSize = inputSize;
+    lastOutputBufferSize = outputSize;
     descriptorSetNeedsUpdate = true;
 
-    // === Pre-allocate working buffers based on expected usage ===
+    // Pre-allocate working buffers
     const float ratio = static_cast<float>(outRate) / inRate;
-    const uint32_t estimatedInputSamples = 2048 * numChannels;  // Typical frame size
+    const uint32_t estimatedInputSamples = 2048 * numChannels;
     const uint32_t estimatedOutputSamples = static_cast<uint32_t>(estimatedInputSamples * ratio);
     
-    workingInputBuffer.reserve(estimatedInputSamples * 2);   // Extra headroom
-    workingOutputBuffer.reserve(estimatedOutputSamples * 2); // Extra headroom
+    workingInputBuffer.reserve(estimatedInputSamples * 2);
+    workingOutputBuffer.reserve(estimatedOutputSamples * 2);
     
     printf("[+] VulkanUpsampler initialized: %uHz -> %uHz (%u channels)\n", 
            inputRate, outputRate, channels);
-    printf("[*] Pre-allocated buffers: input=%zu, output=%zu samples\n",
-           workingInputBuffer.capacity(), workingOutputBuffer.capacity());
 
     return true;
 }
@@ -74,13 +72,11 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
 void VulkanUpsampler::setKernel(ResampleKernel kernel) {
     selectedKernel = kernel;
 
-    // Clean up previous shader module
     if (shaderModule != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device, shaderModule, nullptr);
         shaderModule = VK_NULL_HANDLE;
     }
 
-    // Map kernel enum to shader filename
     std::string filename;
     switch (kernel) {
     case ResampleKernel::Linear:
@@ -104,104 +100,39 @@ void VulkanUpsampler::setKernel(ResampleKernel kernel) {
 }
 
 bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* output, uint32_t& outputFrames) {
-    if (shaderModule == VK_NULL_HANDLE) [[unlikely]] {
-        printf("[!] Shader module not loaded\n");
-        return false;
-    }
-
-    const float ratio = static_cast<float>(outRate) / inRate;
-    const uint32_t inSamples = inputFrames * numChannels;
-
-    // === Safe size conversion ===
-    const size_t tailSize = previousTail.size();
-    
-    // Size check (prevent 32-bit overflow)
-    if (tailSize > UINT32_MAX || inSamples > UINT32_MAX - tailSize) [[unlikely]] {
-        printf("[!] Buffer size exceeds 32-bit limit: tail=%zu, input=%u\n", tailSize, inSamples);
+    if (!enqueue(input, inputFrames)) {
         return false;
     }
     
-    const uint32_t totalInputSamples = static_cast<uint32_t>(tailSize) + inSamples;
-    
-    // Reserve space if needed (avoid frequent reallocations)
-    if (workingInputBuffer.capacity() < totalInputSamples) {
-        workingInputBuffer.reserve(totalInputSamples * 2);  // Reserve extra for future growth
-        printf("[*] Input buffer capacity increased to %zu samples\n", workingInputBuffer.capacity());
+    bool ready = false;
+    // Poll for completion (max 1000 iterations for real-time constraints)
+    // With 1ms timeout per poll, worst case = 1 second
+    for (int i = 0; i < 1000 && !ready; ++i) {
+        if (!poll(ready, output, outputFrames)) {
+            return false;
+        }
+        
+        // Early exit if ready
+        if (ready) {
+            return true;
+        }
     }
     
-    // Efficiently prepare input data
-    workingInputBuffer.clear();
-    workingInputBuffer.insert(workingInputBuffer.end(), previousTail.begin(), previousTail.end());
-    workingInputBuffer.insert(workingInputBuffer.end(), input, input + inSamples);
-
-    // === Safe size conversion (workingInputBuffer.size()) ===
-    const size_t bufferSize = workingInputBuffer.size();
-    if (bufferSize > UINT32_MAX) [[unlikely]] {
-        printf("[!] Working buffer size exceeds 32-bit limit: %zu\n", bufferSize);
+    if (!ready) {
+        printf("[!] GPU processing timeout\n");
         return false;
     }
     
-    const uint32_t fullInSamples = static_cast<uint32_t>(bufferSize);
-    const uint32_t fullInFrames = fullInSamples / numChannels;
-
-    // Calculate buffer requirements
-    const uint32_t maxExpectedInFrames = inputFrames + VulkanConfig::MAX_TAIL_FRAMES;
-
-    // GPU processing pipeline
-    if (!createBuffers(maxExpectedInFrames)) return false;
-    if (!uploadInputToGPU(workingInputBuffer.data(), fullInSamples)) return false;
-    
-    if (computePipeline == VK_NULL_HANDLE) {
-        if (!createPipeline(shaderModule)) return false;
-    }
-    
-    if (!createDescriptorSet()) return false;
-
-    // Execute GPU computation
-    const uint32_t actualOutFrames = static_cast<uint32_t>(fullInFrames * ratio);
-    const uint32_t actualOutSamples = actualOutFrames * numChannels;
-    
-    if (!dispatch(fullInSamples, actualOutSamples)) return false;
-
-    // === Optimized output buffer management ===
-    // Reserve space for output if needed
-    if (workingOutputBuffer.capacity() < actualOutSamples) {
-        workingOutputBuffer.reserve(actualOutSamples * 2);  // Reserve extra for future growth
-        printf("[*] Output buffer capacity increased to %zu samples\n", workingOutputBuffer.capacity());
-    }
-    
-    workingOutputBuffer.resize(actualOutSamples);
-    if (!downloadOutputFromGPU(workingOutputBuffer.data(), actualOutSamples)) return false;
-
-    // Calculate output offset based on tail processing
-    const float tailFramesF = static_cast<float>(tailSize) / numChannels;  // Modified: previousTail.size() -> tailSize
-    const float skipFramesF = tailFramesF * ratio;
-    const uint32_t skipOffset = static_cast<uint32_t>(skipFramesF * numChannels);
-
-    // === Safe size conversion (workingOutputBuffer.size()) ===
-    const size_t outputSize = workingOutputBuffer.size();
-    if (skipOffset > outputSize) [[unlikely]] {
-        printf("[!] Output calculation error: skip=%u > total=%zu\n", skipOffset, outputSize);
-        return false;
-    }
-
-    // Copy final output - Safe conversion
-    if (outputSize > UINT32_MAX) [[unlikely]] {
-        printf("[!] Output buffer size exceeds 32-bit limit: %zu\n", outputSize);
-        return false;
-    }
-    
-    const uint32_t outCopyCount = static_cast<uint32_t>(outputSize) - skipOffset;
-    std::memcpy(output, workingOutputBuffer.data() + skipOffset, outCopyCount * sizeof(float));
-    outputFrames = outCopyCount / numChannels;
-
-    // Update tail buffer for next iteration
-    updateTailBuffer(input, inSamples);
-
     return true;
 }
 
 void VulkanUpsampler::shutdown() {
+    // Wait for any in-flight GPU work to complete before cleanup
+    if (slot.inFlight && slot.fence != VK_NULL_HANDLE && device != VK_NULL_HANDLE) {
+        vkWaitForFences(device, 1, &slot.fence, VK_TRUE, VulkanConfig::FENCE_TIMEOUT);
+        slot.inFlight = false;
+    }
+
     if (slot.initialized) {
         cleanupGpuSlot(slot);
     }
@@ -325,12 +256,12 @@ bool VulkanUpsampler::createCommandObjects() {
         }
     }
 
-    // Create command pool
+    // Create command pool with proper flags for command buffer reset
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.queueFamilyIndex = computeQueueFamily; 
-    // Flag change for pool reset optimization
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;  // For short-lived command buffers
+    poolInfo.queueFamilyIndex = computeQueueFamily;
+    // CRITICAL FIX: Need RESET_COMMAND_BUFFER_BIT to allow individual command buffer reset
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 
     if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS) {
         printf("[!] Failed to create command pool\n");
@@ -377,7 +308,7 @@ VkShaderModule VulkanUpsampler::createShaderModule(const std::string& filename) 
         return VK_NULL_HANDLE;
     }
 
-    printf("[+] Shader module created: %s (%.1f KB)\n", filename.c_str(), fileSize / 1024.0);
+    printf("[+] Shader loaded: %s (%.1f KB)\n", filename.c_str(), fileSize / 1024.0);
     return module;
 }
 
@@ -389,7 +320,7 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
     const VkDeviceSize requiredInputSize = sizeof(float) * totalInputSamples;
     const VkDeviceSize requiredOutputSize = sizeof(float) * totalOutputSamples;
 
-    // Check if resize is necessary
+    // Check if resize needed
     bool needsResize = false;
     if (requiredInputSize > lastInputBufferSize) {
         lastInputBufferSize = requiredInputSize;
@@ -401,24 +332,18 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
     }
 
     if (!needsResize) {
-        return true; // Existing buffers are sufficient
+        return true;
     }
 
-    // Only destroy slot buffer resources (not full slot)
     cleanupSlotBuffers(slot);
     if (!createBuffer(lastInputBufferSize, slot.inputBuffer, slot.inputMemory, &slot.inputPtr, "input")) return false;
     if (!createBuffer(lastOutputBufferSize, slot.outputBuffer, slot.outputMemory, &slot.outputPtr, "output")) return false;
 
     descriptorSetNeedsUpdate = true;
-
-    printf("[+] GPU buffers created: input=%.1f KB, output=%.1f KB (frames=%u)\n",
-        requiredInputSize / 1024.0, requiredOutputSize / 1024.0, inputFrames);
-
     return true;
 }
 
 bool VulkanUpsampler::createBuffer(VkDeviceSize size, VkBuffer& buffer, VkDeviceMemory& memory, void** mappedPtr, const char* label) {
-    // Create buffer
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bufferInfo.size = size;
@@ -430,15 +355,12 @@ bool VulkanUpsampler::createBuffer(VkDeviceSize size, VkBuffer& buffer, VkDevice
         return false;
     }
 
-    // Get memory requirements
     VkMemoryRequirements memRequirements;
     vkGetBufferMemoryRequirements(device, buffer, &memRequirements);
 
-    // Get memory properties (needed for storing memory properties)
     VkPhysicalDeviceMemoryProperties memProps;
     vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProps);
 
-    // Allocate memory
     VkMemoryAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     allocInfo.allocationSize = memRequirements.size;
@@ -454,21 +376,20 @@ bool VulkanUpsampler::createBuffer(VkDeviceSize size, VkBuffer& buffer, VkDevice
     
     allocInfo.memoryTypeIndex = memoryTypeIndex;
     
-    // Store memory properties for later use (IMPORTANT: this was missing!)
-    if (std::string(label) == "input") {
+    // Store memory properties for flush/invalidate operations
+    std::string labelStr(label);
+    if (labelStr.find("input") != std::string::npos) {
         inputMemoryProperties = memProps.memoryTypes[memoryTypeIndex].propertyFlags;
-    } else if (std::string(label) == "output") {
+    } else if (labelStr.find("output") != std::string::npos) {
         outputMemoryProperties = memProps.memoryTypes[memoryTypeIndex].propertyFlags;
     }
 
     if (vkAllocateMemory(device, &allocInfo, nullptr, &memory) != VK_SUCCESS) {
-        printf("[!] Failed to allocate memory for %s buffer (size: %llu bytes)\n",
-            label, static_cast<unsigned long long>(allocInfo.allocationSize));
+        printf("[!] Failed to allocate memory for %s buffer\n", label);
         vkDestroyBuffer(device, buffer, nullptr);
         return false;
     }
 
-    // Bind memory to buffer
     if (vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
         printf("[!] Failed to bind memory for %s buffer\n", label);
         vkFreeMemory(device, memory, nullptr);
@@ -476,7 +397,6 @@ bool VulkanUpsampler::createBuffer(VkDeviceSize size, VkBuffer& buffer, VkDevice
         return false;
     }
 
-    // Map memory for persistent access
     if (vkMapMemory(device, memory, 0, size, 0, mappedPtr) != VK_SUCCESS) {
         printf("[!] Failed to map %s memory\n", label);
         vkFreeMemory(device, memory, nullptr);
@@ -510,7 +430,7 @@ bool VulkanUpsampler::uploadInputToGPU(const float* input, uint32_t totalSamples
     const VkDeviceSize size = sizeof(float) * totalSamples;
     std::memcpy(slot.inputPtr, input, size);
 
-    // Flush if memory is not coherent
+    // Flush if non-coherent
     if (!(inputMemoryProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
         VkMappedMemoryRange flushRange{};
         flushRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
@@ -528,16 +448,13 @@ bool VulkanUpsampler::uploadInputToGPU(const float* input, uint32_t totalSamples
 }
 
 bool VulkanUpsampler::createPipeline(VkShaderModule shader) {
-    // Create descriptor set layout
     VkDescriptorSetLayoutBinding bindings[2]{};
 
-    // Input buffer binding
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[0].descriptorCount = 1;
     bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-    // Output buffer binding  
     bindings[1].binding = 1;
     bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[1].descriptorCount = 1;
@@ -553,13 +470,11 @@ bool VulkanUpsampler::createPipeline(VkShaderModule shader) {
         return false;
     }
 
-    // Create push constant range
     VkPushConstantRange pushRange{};
     pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pushRange.offset = 0;
     pushRange.size = sizeof(PushConstants);
 
-    // Create pipeline layout
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
     pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pipelineLayoutInfo.setLayoutCount = 1;
@@ -572,14 +487,12 @@ bool VulkanUpsampler::createPipeline(VkShaderModule shader) {
         return false;
     }
 
-    // Create shader stage
     VkPipelineShaderStageCreateInfo shaderStage{};
     shaderStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     shaderStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     shaderStage.module = shader;
     shaderStage.pName = "main";
 
-    // Create compute pipeline
     VkComputePipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipelineInfo.stage = shaderStage;
@@ -590,107 +503,66 @@ bool VulkanUpsampler::createPipeline(VkShaderModule shader) {
         return false;
     }
 
-    printf("[+] Compute pipeline created successfully\n");
     return true;
 }
 
 bool VulkanUpsampler::createDescriptorSet() {
-    if (descriptorSetLayout == VK_NULL_HANDLE) [[unlikely]] {
-        printf("[!] Descriptor set layout not created\n");
+    if (descriptorSetLayout == VK_NULL_HANDLE || pipelineLayout == VK_NULL_HANDLE) {
+        printf("[!] Descriptor set layout or pipeline layout not initialized\n");
         return false;
     }
 
-    // Create descriptor pool if needed
     if (descriptorPool == VK_NULL_HANDLE) {
-        VkDescriptorPoolSize poolSize{};
-        poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSize.descriptorCount = 2;
-
-        VkDescriptorPoolCreateInfo poolInfo{};
-        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolInfo.poolSizeCount = 1;
-        poolInfo.pPoolSizes = &poolSize;
-        poolInfo.maxSets = 1;
-
-        if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
-            printf("[!] Failed to create descriptor pool\n");
+        VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
+        VkDescriptorPoolCreateInfo pi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        pi.poolSizeCount = 1; 
+        pi.pPoolSizes = &poolSize; 
+        pi.maxSets = 1;
+        if (vkCreateDescriptorPool(device, &pi, nullptr, &descriptorPool) != VK_SUCCESS) {
+            printf("[!] Failed to create descriptor pool\n"); 
             return false;
         }
     }
 
-    // Allocate descriptor set if needed
     if (descriptorSet == VK_NULL_HANDLE) {
-        VkDescriptorSetAllocateInfo allocInfo{};
-        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        allocInfo.descriptorPool = descriptorPool;
-        allocInfo.descriptorSetCount = 1;
-        allocInfo.pSetLayouts = &descriptorSetLayout;
-
-        if (vkAllocateDescriptorSets(device, &allocInfo, &descriptorSet) != VK_SUCCESS) {
-            printf("[!] Failed to allocate descriptor set\n");
+        VkDescriptorSetAllocateInfo ai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        ai.descriptorPool = descriptorPool; 
+        ai.descriptorSetCount = 1; 
+        ai.pSetLayouts = &descriptorSetLayout;
+        if (vkAllocateDescriptorSets(device, &ai, &descriptorSet) != VK_SUCCESS) {
+            printf("[!] Failed to allocate descriptor set\n"); 
             return false;
         }
-        descriptorSetNeedsUpdate = true;  // Update needed when newly created
+        descriptorSetNeedsUpdate = true;
     }
 
-    // Optimization: Update only when buffers have changed
     if (descriptorSetNeedsUpdate) {
-        VkDescriptorBufferInfo inputInfo{};
-        inputInfo.buffer = slot.inputBuffer;
-        inputInfo.offset = 0;
-        inputInfo.range = VK_WHOLE_SIZE;
-
-        VkDescriptorBufferInfo outputInfo{};
-        outputInfo.buffer = slot.outputBuffer;
-        outputInfo.offset = 0;
-        outputInfo.range = VK_WHOLE_SIZE;
-
+        VkDescriptorBufferInfo inInfo{ slot.inputBuffer, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo outInfo{ slot.outputBuffer, 0, VK_WHOLE_SIZE };
         VkWriteDescriptorSet writes[2]{};
-        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = descriptorSet;
-        writes[0].dstBinding = 0;
-        writes[0].descriptorCount = 1;
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[0].pBufferInfo = &inputInfo;
-
-        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = descriptorSet;
-        writes[1].dstBinding = 1;
-        writes[1].descriptorCount = 1;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[1].pBufferInfo = &outputInfo;
-
+        writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &inInfo, nullptr };
+        writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &outInfo, nullptr };
         vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
-        descriptorSetNeedsUpdate = false;  // Update completed
-        printf("[*] Descriptor set updated\n");
+        descriptorSetNeedsUpdate = false;
     }
 
     return true;
 }
 
 bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
-    if (!slot.initialized) {
-        printf("[!] GpuSlot not initialized\n");
+    if (slot.inFlight) {
         return false;
     }
 
-    if (computePipeline == VK_NULL_HANDLE || pipelineLayout == VK_NULL_HANDLE) [[unlikely]] {
-        printf("[!] Pipeline not ready for dispatch\n");
-        return false;
-    }
-
-    // === Wait for previous work to complete ===
     VkResult fenceStatus = vkGetFenceStatus(device, slot.fence);
     if (fenceStatus == VK_NOT_READY) {
-        if (vkWaitForFences(device, 1, &slot.fence, VK_TRUE, VulkanConfig::FENCE_TIMEOUT) != VK_SUCCESS) {
-            printf("[!] Failed to wait for previous GPU work\n");
-            return false;
-        }
+        return false;
     }
 
-    vkResetFences(device, 1, &slot.fence);
+    if (fenceStatus == VK_SUCCESS) {
+        vkResetFences(device, 1, &slot.fence);
+    }
 
-    // === Reset command buffer ===
     if (vkResetCommandBuffer(slot.commandBuffer, 0) != VK_SUCCESS) {
         printf("[!] Failed to reset command buffer\n");
         return false;
@@ -704,7 +576,6 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
         return false;
     }
 
-    // === Record compute commands ===
     vkCmdBindPipeline(slot.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
     vkCmdBindDescriptorSets(slot.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
 
@@ -712,10 +583,9 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
     push.inFrameCount = inSamples / numChannels;
     push.outFrameCount = outSamples / numChannels;
     push.ratio = static_cast<float>(static_cast<double>(outRate) / inRate);
-
     vkCmdPushConstants(slot.commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &push);
 
-    // Memory barrier for input buffer
+    // Memory barriers for CPU-GPU synchronization
     VkMemoryBarrier inputBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     inputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
     inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -730,12 +600,9 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
         0, nullptr
     );
 
-    const uint32_t totalSampleThreads = outSamples;
-    const uint32_t groupCount = (totalSampleThreads + VulkanConfig::WORKGROUP_SIZE - 1) / VulkanConfig::WORKGROUP_SIZE;
-
+    const uint32_t groupCount = (outSamples + VulkanConfig::WORKGROUP_SIZE - 1) / VulkanConfig::WORKGROUP_SIZE;
     vkCmdDispatch(slot.commandBuffer, groupCount, 1, 1);
 
-    // Memory barrier for output buffer
     VkMemoryBarrier outputBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     outputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     outputBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -755,7 +622,6 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
         return false;
     }
 
-    // === Submit ===
     VkSubmitInfo submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
@@ -766,13 +632,114 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
         return false;
     }
 
-    // === Wait (synchronous) ===
-    const VkResult waitResult = vkWaitForFences(device, 1, &slot.fence, VK_TRUE, VulkanConfig::FENCE_TIMEOUT);
-    if (waitResult != VK_SUCCESS) {
-        printf("[!] GPU dispatch timeout or error\n");
+    slot.inFlight = true;
+    return true;
+}
+
+bool VulkanUpsampler::enqueue(const float* input, uint32_t inputFrames) {
+    if (!slot.initialized || shaderModule == VK_NULL_HANDLE) {
         return false;
     }
 
+    const float ratio = static_cast<float>(outRate) / inRate;
+    const uint32_t inSamples = inputFrames * numChannels;
+
+    // Combine tail from previous frame with current input
+    const size_t tailSize = previousTail.size();
+    if (tailSize > UINT32_MAX || inSamples > UINT32_MAX - tailSize) {
+        return false;
+    }
+
+    workingInputBuffer.clear();
+    workingInputBuffer.insert(workingInputBuffer.end(), previousTail.begin(), previousTail.end());
+    workingInputBuffer.insert(workingInputBuffer.end(), input, input + inSamples);
+
+    const uint32_t fullInSamples = static_cast<uint32_t>(workingInputBuffer.size());
+    const uint32_t fullInFrames = fullInSamples / numChannels;
+    const uint32_t outFrames = static_cast<uint32_t>(fullInFrames * ratio);
+    const uint32_t outSamples = outFrames * numChannels;
+
+    // Calculate skip offset to remove tail's contribution from output
+    const uint32_t skipOffset = static_cast<uint32_t>((static_cast<float>(tailSize) / numChannels) * ratio) * numChannels;
+
+    if (!createBuffers(fullInFrames)) {
+        return false;
+    }
+
+    if (computePipeline == VK_NULL_HANDLE) {
+        if (!createPipeline(shaderModule)) {
+            return false;
+        }
+    }
+    
+    if (descriptorSet == VK_NULL_HANDLE || descriptorSetNeedsUpdate) {
+        if (!createDescriptorSet()) {
+            return false;
+        }
+    }
+
+    if (!uploadInputToGPU(workingInputBuffer.data(), fullInSamples)) {
+        return false;
+    }
+
+    if (!dispatch(fullInSamples, outSamples)) {
+        return false;
+    }
+
+    slot.sequenceId = nextSequenceId++;
+    slot.expectedOutSamples = outSamples;
+    slot.skipOffset = skipOffset;
+
+    updateTailBuffer(input, inSamples);
+
+    return true;
+}
+
+bool VulkanUpsampler::poll(bool& ready, float* output, uint32_t& outputFrames) {
+    ready = false;
+    
+    if (!slot.inFlight) {
+        return true;
+    }
+
+    // Use 1ms timeout - proven to work reliably
+    // Shorter timeouts (0 or 100us) can cause fence signal issues on some drivers
+    const uint64_t timeoutNs = 1000000; // 1ms in nanoseconds
+    VkResult waitResult = vkWaitForFences(device, 1, &slot.fence, VK_TRUE, timeoutNs);
+    
+    if (waitResult == VK_TIMEOUT) {
+        // GPU still working, will try again on next poll
+        return true;
+    }
+    
+    if (waitResult != VK_SUCCESS) {
+        printf("[!] Fence wait error: %d\n", waitResult);
+        return false;
+    }
+
+    // Download results
+    const uint32_t total = slot.expectedOutSamples;
+    if (workingOutputBuffer.capacity() < total) {
+        workingOutputBuffer.reserve(total * 2);
+    }
+    workingOutputBuffer.resize(total);
+
+    if (!downloadOutputFromGPU(workingOutputBuffer.data(), total)) {
+        return false;
+    }
+
+    // Apply skip offset and copy to output
+    if (slot.skipOffset > total) {
+        printf("[!] Skip offset exceeds total output\n");
+        return false;
+    }
+    
+    const uint32_t copySamples = total - slot.skipOffset;
+    std::memcpy(output, workingOutputBuffer.data() + slot.skipOffset, sizeof(float) * copySamples);
+    outputFrames = copySamples / numChannels;
+
+    slot.inFlight = false;
+    ready = true;
     return true;
 }
 
@@ -782,7 +749,7 @@ bool VulkanUpsampler::downloadOutputFromGPU(float* output, uint32_t totalSamples
         return false;
     }
 
-    // Invalidate cache if memory is not coherent
+    // Invalidate cache if non-coherent
     if (!(outputMemoryProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
         VkMappedMemoryRange range{};
         range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
@@ -791,7 +758,7 @@ bool VulkanUpsampler::downloadOutputFromGPU(float* output, uint32_t totalSamples
         range.size = sizeof(float) * totalSamples;
 
         if (vkInvalidateMappedMemoryRanges(device, 1, &range) != VK_SUCCESS) {
-            printf("[!] Failed to invalidate output memory range\n");
+            printf("[!] Failed to invalidate output memory\n");
             return false;
         }
     }
@@ -804,10 +771,8 @@ void VulkanUpsampler::updateTailBuffer(const float* input, uint32_t inSamples) {
     const uint32_t tailStoreSamples = VulkanConfig::MAX_TAIL_FRAMES * numChannels;
     
     if (inSamples >= tailStoreSamples) {
-        // Store last portion of input as new tail
         previousTail.assign(input + inSamples - tailStoreSamples, input + inSamples);
     } else {
-        // Store entire input as tail (input is smaller than tail buffer)
         previousTail.assign(input, input + inSamples);
     }
 }
@@ -852,16 +817,12 @@ void VulkanUpsampler::cleanupVulkan() {
         instance = VK_NULL_HANDLE;
     }
 
-    // Reset all handles
     physicalDevice = VK_NULL_HANDLE;
     computeQueue = VK_NULL_HANDLE;
 }
 
 void VulkanUpsampler::cleanupGpuSlot(GpuSlot& cleanupSlot) {
-    if (cleanupSlot.commandBuffer != VK_NULL_HANDLE) {
-        // Command buffers are freed automatically with the pool (can be omitted)
-        cleanupSlot.commandBuffer = VK_NULL_HANDLE;
-    }
+    cleanupSlot.commandBuffer = VK_NULL_HANDLE;
 
     if (cleanupSlot.fence != VK_NULL_HANDLE) {
         vkDestroyFence(device, cleanupSlot.fence, nullptr);

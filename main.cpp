@@ -190,6 +190,22 @@ public:
         return ma_device_start(&playbackDevice) == MA_SUCCESS;
     }
 
+    void stopDevices() {
+        printf("[*] Stopping audio devices...\n");
+        
+        if (captureInitialized) {
+            ma_device_stop(&captureDevice);
+        }
+        
+        if (playbackInitialized) {
+            ma_device_stop(&playbackDevice);
+        }
+        
+        // Give callbacks time to exit
+        ma_sleep(50);
+        printf("[+] Audio devices stopped\n");
+    }
+
     // Forward declarations for callback functions
     static void capture_callback(ma_device* device, void* output, const void* input, ma_uint32 frameCount);
     static void playback_callback(ma_device* device, void* output, const void* input, ma_uint32 frameCount);
@@ -223,6 +239,11 @@ void AudioDeviceManager::capture_callback(ma_device* device, void* output, const
     (void)output; // Explicitly mark as unused
     (void)device; // Explicitly mark as unused
 
+    // Check if we're shutting down
+    if (!g_running.load(std::memory_order_acquire)) {
+        return;
+    }
+
     if (!input || !g_upsampler) [[unlikely]] {
         return;
     }
@@ -234,13 +255,24 @@ void AudioDeviceManager::capture_callback(ma_device* device, void* output, const
         const uint32_t outputSamples = outputFrames * AudioConfig::CHANNELS;
         g_ring.push(outputBuffer, outputSamples);
     } else [[unlikely]] {
-        printf("[!] GPU processing failed\n");
+        // Only log errors if not shutting down
+        if (g_running.load(std::memory_order_acquire)) {
+            printf("[!] GPU processing failed\n");
+        }
     }
 }
 
 void AudioDeviceManager::playback_callback(ma_device* device, void* output, const void* input, ma_uint32 frameCount) {
     (void)input;  // Explicitly mark as unused
     (void)device; // Explicitly mark as unused
+
+    // Check if we're shutting down
+    if (!g_running.load(std::memory_order_acquire)) {
+        auto* outputSamples = static_cast<float*>(output);
+        const uint32_t requiredSamples = frameCount * AudioConfig::CHANNELS;
+        std::memset(outputSamples, 0, requiredSamples * sizeof(float));
+        return;
+    }
 
     auto* outputSamples = static_cast<float*>(output);
     const uint32_t requiredSamples = frameCount * AudioConfig::CHANNELS;
@@ -301,11 +333,18 @@ int main() {
 
     printf("[+] Real-time GPU upsampler started (%u -> %uHz)\n", 
            AudioConfig::INPUT_SAMPLE_RATE, AudioConfig::OUTPUT_SAMPLE_RATE);
+    printf("[*] Press Ctrl+C to stop...\n");
 
     // Run main processing loop
     runMainLoop(deviceManager);
 
-    // Cleanup resources
+    // Graceful shutdown sequence
+    printf("[*] Initiating shutdown sequence...\n");
+    
+    // Step 1: Stop audio devices first to prevent callbacks from running
+    deviceManager.stopDevices();
+    
+    // Step 2: Cleanup GPU resources
     if (g_upsampler) {
         g_upsampler->shutdown();
         g_upsampler.reset();

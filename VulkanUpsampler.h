@@ -3,6 +3,9 @@
 #include <vulkan/vulkan.h>
 #include <string>
 #include <vector>
+#include <array>
+#include <queue>
+#include <functional>
 
 struct GpuSlot {
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
@@ -16,12 +19,33 @@ struct GpuSlot {
     VkDeviceMemory outputMemory = VK_NULL_HANDLE;
     void* outputPtr = nullptr;
 
+    // Per-slot descriptor set for independent resource binding
+    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    bool descriptorNeedsUpdate = true;
+
+    // Per-slot buffer size tracking
+    VkDeviceSize inputBufferSize = 0;
+    VkDeviceSize outputBufferSize = 0;
+
     // async state
     bool initialized = false;
     bool inFlight = false;
     uint64_t sequenceId = 0;
     uint32_t expectedOutSamples = 0;
     uint32_t skipOffset = 0; // samples to skip due to tail
+    
+    // Callback storage for async API
+    std::function<void(const float*, uint32_t)> callback;
+};
+
+/**
+ * @brief Result structure for async completion
+ */
+struct AsyncResult {
+    uint64_t sequenceId;
+    std::vector<float> data;
+    uint32_t frameCount;
+    bool success;
 };
 
 /**
@@ -29,21 +53,48 @@ struct GpuSlot {
  */
 class VulkanUpsampler : public GpuUpsampler {
 public:
+    using CompletionCallback = std::function<void(const float* output, uint32_t outputFrames)>;
+
     bool initialize(uint32_t inputRate, uint32_t outputRate, uint32_t channels) override;
+    
     void setKernel(ResampleKernel kernel) override;
+    
+    // === Synchronous API (backward compatible) ===
     bool process(const float* input, uint32_t inputFrames, float* output, uint32_t& outputFrames) override;
-    // Perform submission only (no waiting). Returns true on successful submission, false if slot is busy
+    
+    // === Asynchronous API (new) ===
+    
+    /// @brief Submit work without waiting (fully async)
+    /// @param input Input audio data
+    /// @param inputFrames Number of input frames
+    /// @param callback Called when processing completes (can be nullptr)
+    /// @return Sequence ID for tracking, or 0 on failure
+    uint64_t processAsync(const float* input, uint32_t inputFrames, CompletionCallback callback = nullptr);
+    
+    /// @brief Check all pending work without blocking (event-driven friendly)
+    /// @param results Vector to store completed results
+    /// @return Number of completed works
+    size_t tryPollAll(std::vector<AsyncResult>& results);
+    
+    /// @brief Get number of pending works
+    size_t getPendingCount() const { return pendingQueue.size(); }
+    
+    /// @brief Get number of available slots
+    size_t getAvailableSlots() const;
+    
+    // === Low-level API (for manual control) ===
     bool enqueue(const float* input, uint32_t inputFrames);
-    // Check completion status. If ready=false, it's not completed yet. If ready=true, write the order-guaranteed results to output and set outputFrames
     bool poll(bool& ready, float* output, uint32_t& outputFrames);
+    
     void shutdown() override;
 
     /// @brief Create shader module from SPIR-V bytecode file
-    /// @param filename Path to compiled shader file
-    /// @return Valid shader module or VK_NULL_HANDLE on failure
     VkShaderModule createShaderModule(const std::string& filename);
 
 private:
+    // === Multi-Slot Configuration ===
+    static constexpr uint32_t NUM_SLOTS = 3;  // Change this to adjust parallel capacity
+
     // === Initialization and Cleanup ===
     
     /// @brief Initialize Vulkan instance, device, and command objects
@@ -67,12 +118,14 @@ private:
 
     // === Resource Management ===
     
-    /// @brief Create input/output buffers for given frame count
+    /// @brief Create input/output buffers for given frame count and slot
     /// @param inputFrames Maximum number of input frames to support
-    bool createBuffers(uint32_t inputFrames);
+    /// @param slotIndex Target slot index
+    bool createBuffers(uint32_t inputFrames, uint32_t slotIndex);
     
-    /// @brief Create and bind descriptor sets for buffers
-    bool createDescriptorSet();
+    /// @brief Create descriptor set for specific slot
+    /// @param slotIndex Target slot index
+    bool createDescriptorSet(uint32_t slotIndex);
     
     /// @brief Create compute pipeline with given shader
     /// @param shaderModule Compiled shader module
@@ -84,20 +137,29 @@ private:
     
     // === Data Transfer ===
     
-    /// @brief Upload input data to GPU buffer
+    /// @brief Upload input data to GPU buffer for specific slot
     /// @param input Source audio data
     /// @param totalSamples Number of samples to upload
-    bool uploadInputToGPU(const float* input, uint32_t totalSamples);
+    /// @param slotIndex Target slot index
+    bool uploadInputToGPU(const float* input, uint32_t totalSamples, uint32_t slotIndex);
     
-    /// @brief Download processed data from GPU buffer
+    /// @brief Download processed data from GPU buffer for specific slot
     /// @param output Destination buffer
     /// @param totalSamples Number of samples to download
-    bool downloadOutputFromGPU(float* output, uint32_t totalSamples);
+    /// @param slotIndex Source slot index
+    bool downloadOutputFromGPU(float* output, uint32_t totalSamples, uint32_t slotIndex);
     
-    /// @brief Dispatch compute shader with given sample counts
+    /// @brief Dispatch compute shader with given sample counts for specific slot
     /// @param inSamples Input sample count
-    /// @param outSamples Output sample count  
-    bool dispatch(uint32_t inSamples, uint32_t outSamples);
+    /// @param outSamples Output sample count
+    /// @param slotIndex Target slot index
+    bool dispatch(uint32_t inSamples, uint32_t outSamples, uint32_t slotIndex);
+
+    // === Slot Management ===
+    
+    /// @brief Find an available slot (not in-flight)
+    /// @return Slot index, or -1 if all slots are busy
+    int findAvailableSlot() const;
 
     // === Utility Functions ===
     void updateTailBuffer(const float* input, uint32_t inSamples);
@@ -147,15 +209,19 @@ private:
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
     VkPipeline computePipeline = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    // Note: individual descriptor sets now stored per-slot
 
-    // add state tracking for optimization
-    bool descriptorSetNeedsUpdate = true;
-    VkDeviceSize lastInputBufferSize = 0;
-    VkDeviceSize lastOutputBufferSize = 0;
-
-    // async sequencing
+    // === Multi-Slot State ===
+    std::array<GpuSlot, NUM_SLOTS> slots;
+    uint32_t currentSlotIndex = 0;  // Round-robin slot selection
+    
+    // === Async Sequencing ===
     uint64_t nextSequenceId = 0;
-
-    GpuSlot slot;
+    
+    // Queue to track submission order for result retrieval
+    struct PendingWork {
+        uint32_t slotIndex;
+        uint64_t sequenceId;
+    };
+    std::queue<PendingWork> pendingQueue;
 };

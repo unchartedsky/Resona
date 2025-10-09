@@ -31,29 +31,35 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
         return false;
     }
 
-    // Create fence for async synchronization
-    VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    if (vkCreateFence(device, &fenceInfo, nullptr, &slot.fence) != VK_SUCCESS) {
-        printf("[!] Failed to create slot fence\n");
-        return false;
-    }
-
-    // Allocate initial GPU buffers
+    // Initialize all slots
     VkDeviceSize inputSize = 4096 * sizeof(float);
-    if (!createBuffer(inputSize, slot.inputBuffer, slot.inputMemory, &slot.inputPtr, "slot.input")) {
-        return false;
-    }
-
     VkDeviceSize outputSize = 8192 * sizeof(float);
-    if (!createBuffer(outputSize, slot.outputBuffer, slot.outputMemory, &slot.outputPtr, "slot.output")) {
-        return false;
-    }
 
-    slot.initialized = true;
-    lastInputBufferSize = inputSize;
-    lastOutputBufferSize = outputSize;
-    descriptorSetNeedsUpdate = true;
+    for (uint32_t i = 0; i < NUM_SLOTS; ++i) {
+        // Create fence for async synchronization
+        VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        if (vkCreateFence(device, &fenceInfo, nullptr, &slots[i].fence) != VK_SUCCESS) {
+            printf("[!] Failed to create fence for slot %u\n", i);
+            return false;
+        }
+
+        // Allocate initial GPU buffers
+        if (!createBuffer(inputSize, slots[i].inputBuffer, slots[i].inputMemory, &slots[i].inputPtr, "slot.input")) {
+            printf("[!] Failed to create input buffer for slot %u\n", i);
+            return false;
+        }
+
+        if (!createBuffer(outputSize, slots[i].outputBuffer, slots[i].outputMemory, &slots[i].outputPtr, "slot.output")) {
+            printf("[!] Failed to create output buffer for slot %u\n", i);
+            return false;
+        }
+
+        slots[i].inputBufferSize = inputSize;
+        slots[i].outputBufferSize = outputSize;
+        slots[i].descriptorNeedsUpdate = true;
+        slots[i].initialized = true;
+    }
 
     // Pre-allocate working buffers
     const float ratio = static_cast<float>(outRate) / inRate;
@@ -63,20 +69,31 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
     workingInputBuffer.reserve(estimatedInputSamples * 2);
     workingOutputBuffer.reserve(estimatedOutputSamples * 2);
     
-    printf("[+] VulkanUpsampler initialized: %uHz -> %uHz (%u channels)\n", 
-           inputRate, outputRate, channels);
-
+    printf("[+] VulkanUpsampler initialized: %uHz -> %uHz (%u channels, %u slots)\n", 
+           inputRate, outputRate, channels, NUM_SLOTS);
+    
     return true;
 }
 
 void VulkanUpsampler::setKernel(ResampleKernel kernel) {
+    // If kernel hasn't changed and pipeline already exists, skip recreation
+    if (kernel == selectedKernel && computePipeline != VK_NULL_HANDLE) {
+        return;
+    }
+
     selectedKernel = kernel;
 
+    // Clean up old shader and pipeline if they exist
+    if (computePipeline != VK_NULL_HANDLE) {
+        cleanupPipeline();
+    }
+    
     if (shaderModule != VK_NULL_HANDLE) {
         vkDestroyShaderModule(device, shaderModule, nullptr);
         shaderModule = VK_NULL_HANDLE;
     }
 
+    // Load new shader
     std::string filename;
     switch (kernel) {
     case ResampleKernel::Linear:
@@ -96,7 +113,32 @@ void VulkanUpsampler::setKernel(ResampleKernel kernel) {
     shaderModule = createShaderModule(filename);
     if (shaderModule == VK_NULL_HANDLE) {
         printf("[!] Failed to load shader module: %s\n", filename.c_str());
+        return;
     }
+
+    // Create pipeline with new shader
+    if (!createPipeline(shaderModule)) {
+        printf("[!] Failed to create compute pipeline\n");
+        vkDestroyShaderModule(device, shaderModule, nullptr);
+        shaderModule = VK_NULL_HANDLE;
+        return;
+    }
+
+    // Recreate descriptor sets for all slots with new pipeline
+    for (uint32_t i = 0; i < NUM_SLOTS; ++i) {
+        // Mark descriptor as needing update
+        slots[i].descriptorNeedsUpdate = true;
+        
+        if (!createDescriptorSet(i)) {
+            printf("[!] Failed to create descriptor set for slot %u\n", i);
+            cleanupPipeline();
+            vkDestroyShaderModule(device, shaderModule, nullptr);
+            shaderModule = VK_NULL_HANDLE;
+            return;
+        }
+    }
+    
+    printf("[+] Pipeline ready (%s kernel)\n", filename.c_str());
 }
 
 bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* output, uint32_t& outputFrames) {
@@ -105,8 +147,7 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
     }
     
     bool ready = false;
-    // Poll for completion (max 1000 iterations for real-time constraints)
-    // With 1ms timeout per poll, worst case = 1 second
+    // First, try non-blocking polls
     for (int i = 0; i < 1000 && !ready; ++i) {
         if (!poll(ready, output, outputFrames)) {
             return false;
@@ -115,6 +156,30 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
         // Early exit if ready
         if (ready) {
             return true;
+        }
+        
+        // Small yield to prevent tight spin loop
+        if (i % 10 == 0) {
+            std::this_thread::yield();
+        }
+    }
+    
+    // If still not ready after 1000 iterations, do a blocking wait
+    if (!ready && !pendingQueue.empty()) {
+        const PendingWork& work = pendingQueue.front();
+        GpuSlot& slot = slots[work.slotIndex];
+        
+        if (slot.inFlight && slot.fence != VK_NULL_HANDLE) {
+            // Final blocking wait with timeout
+            const uint64_t timeoutNs = 10000000; // 10ms timeout
+            VkResult waitResult = vkWaitForFences(device, 1, &slot.fence, VK_TRUE, timeoutNs);
+            
+            if (waitResult == VK_SUCCESS) {
+                // Try poll one more time
+                if (!poll(ready, output, outputFrames)) {
+                    return false;
+                }
+            }
         }
     }
     
@@ -127,14 +192,21 @@ bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* o
 }
 
 void VulkanUpsampler::shutdown() {
-    // Wait for any in-flight GPU work to complete before cleanup
-    if (slot.inFlight && slot.fence != VK_NULL_HANDLE && device != VK_NULL_HANDLE) {
-        vkWaitForFences(device, 1, &slot.fence, VK_TRUE, VulkanConfig::FENCE_TIMEOUT);
-        slot.inFlight = false;
-    }
+    // Wait for all in-flight GPU work to complete before cleanup
+    if (device != VK_NULL_HANDLE) {
+        for (uint32_t i = 0; i < NUM_SLOTS; ++i) {
+            if (slots[i].inFlight && slots[i].fence != VK_NULL_HANDLE) {
+                vkWaitForFences(device, 1, &slots[i].fence, VK_TRUE, VulkanConfig::FENCE_TIMEOUT);
+                slots[i].inFlight = false;
+            }
+        }
 
-    if (slot.initialized) {
-        cleanupGpuSlot(slot);
+        // Clean up all slots
+        for (uint32_t i = 0; i < NUM_SLOTS; ++i) {
+            if (slots[i].initialized) {
+                cleanupGpuSlot(slots[i]);
+            }
+        }
     }
 
     cleanupPipeline();
@@ -260,7 +332,6 @@ bool VulkanUpsampler::createCommandObjects() {
     VkCommandPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.queueFamilyIndex = computeQueueFamily;
-    // CRITICAL FIX: Need RESET_COMMAND_BUFFER_BIT to allow individual command buffer reset
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 
     if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS) {
@@ -268,16 +339,22 @@ bool VulkanUpsampler::createCommandObjects() {
         return false;
     }
 
-    // Allocate command buffer
+    // Allocate command buffers for all slots
     VkCommandBufferAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     allocInfo.commandPool = commandPool;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
+    allocInfo.commandBufferCount = NUM_SLOTS;
 
-    if (vkAllocateCommandBuffers(device, &allocInfo, &slot.commandBuffer) != VK_SUCCESS) {
-        printf("[!] Failed to allocate command buffer\n");
+    std::array<VkCommandBuffer, NUM_SLOTS> commandBuffers;
+    if (vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data()) != VK_SUCCESS) {
+        printf("[!] Failed to allocate command buffers\n");
         return false;
+    }
+
+    // Assign command buffers to slots
+    for (uint32_t i = 0; i < NUM_SLOTS; ++i) {
+        slots[i].commandBuffer = commandBuffers[i];
     }
 
     return true;
@@ -312,7 +389,14 @@ VkShaderModule VulkanUpsampler::createShaderModule(const std::string& filename) 
     return module;
 }
 
-bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
+bool VulkanUpsampler::createBuffers(uint32_t inputFrames, uint32_t slotIndex) {
+    if (slotIndex >= NUM_SLOTS) {
+        printf("[!] Invalid slot index: %u\n", slotIndex);
+        return false;
+    }
+
+    GpuSlot& slot = slots[slotIndex];
+
     const float ratio = static_cast<float>(outRate) / inRate;
     const uint32_t totalInputSamples = inputFrames * numChannels;
     const uint32_t totalOutputSamples = static_cast<uint32_t>(inputFrames * ratio) * numChannels;
@@ -320,14 +404,14 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
     const VkDeviceSize requiredInputSize = sizeof(float) * totalInputSamples;
     const VkDeviceSize requiredOutputSize = sizeof(float) * totalOutputSamples;
 
-    // Check if resize needed
+    // Check if resize needed for this slot
     bool needsResize = false;
-    if (requiredInputSize > lastInputBufferSize) {
-        lastInputBufferSize = requiredInputSize;
+    if (requiredInputSize > slot.inputBufferSize) {
+        slot.inputBufferSize = requiredInputSize;
         needsResize = true;
     }
-    if (requiredOutputSize > lastOutputBufferSize) {
-        lastOutputBufferSize = requiredOutputSize;
+    if (requiredOutputSize > slot.outputBufferSize) {
+        slot.outputBufferSize = requiredOutputSize;
         needsResize = true;
     }
 
@@ -335,11 +419,12 @@ bool VulkanUpsampler::createBuffers(uint32_t inputFrames) {
         return true;
     }
 
+    // Recreate buffers for this slot
     cleanupSlotBuffers(slot);
-    if (!createBuffer(lastInputBufferSize, slot.inputBuffer, slot.inputMemory, &slot.inputPtr, "input")) return false;
-    if (!createBuffer(lastOutputBufferSize, slot.outputBuffer, slot.outputMemory, &slot.outputPtr, "output")) return false;
+    if (!createBuffer(slot.inputBufferSize, slot.inputBuffer, slot.inputMemory, &slot.inputPtr, "input")) return false;
+    if (!createBuffer(slot.outputBufferSize, slot.outputBuffer, slot.outputMemory, &slot.outputPtr, "output")) return false;
 
-    descriptorSetNeedsUpdate = true;
+    slot.descriptorNeedsUpdate = true;
     return true;
 }
 
@@ -421,9 +506,16 @@ uint32_t VulkanUpsampler::findMemoryType(uint32_t typeFilter, VkMemoryPropertyFl
     throw std::runtime_error("Failed to find suitable memory type");
 }
 
-bool VulkanUpsampler::uploadInputToGPU(const float* input, uint32_t totalSamples) {
+bool VulkanUpsampler::uploadInputToGPU(const float* input, uint32_t totalSamples, uint32_t slotIndex) {
+    if (slotIndex >= NUM_SLOTS) {
+        printf("[!] Invalid slot index: %u\n", slotIndex);
+        return false;
+    }
+
+    GpuSlot& slot = slots[slotIndex];
+
     if (!slot.inputPtr) [[unlikely]] {
-        printf("[!] Input memory not mapped\n");
+        printf("[!] Input memory not mapped for slot %u\n", slotIndex);
         return false;
     }
 
@@ -439,7 +531,7 @@ bool VulkanUpsampler::uploadInputToGPU(const float* input, uint32_t totalSamples
         flushRange.size = size;
         
         if (vkFlushMappedMemoryRanges(device, 1, &flushRange) != VK_SUCCESS) {
-            printf("[!] Failed to flush input memory\n");
+            printf("[!] Failed to flush input memory for slot %u\n", slotIndex);
             return false;
         }
     }
@@ -506,138 +598,200 @@ bool VulkanUpsampler::createPipeline(VkShaderModule shader) {
     return true;
 }
 
-bool VulkanUpsampler::createDescriptorSet() {
+bool VulkanUpsampler::createDescriptorSet(uint32_t slotIndex) {
     if (descriptorSetLayout == VK_NULL_HANDLE || pipelineLayout == VK_NULL_HANDLE) {
         printf("[!] Descriptor set layout or pipeline layout not initialized\n");
         return false;
     }
 
+    if (slotIndex >= NUM_SLOTS) {
+        printf("[!] Invalid slot index: %u\n", slotIndex);
+        return false;
+    }
+
+    GpuSlot& slot = slots[slotIndex];
+
+    // Create descriptor pool if not exists (shared across all slots)
     if (descriptorPool == VK_NULL_HANDLE) {
-        VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 };
+        VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * NUM_SLOTS };
         VkDescriptorPoolCreateInfo pi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
         pi.poolSizeCount = 1; 
         pi.pPoolSizes = &poolSize; 
-        pi.maxSets = 1;
+        pi.maxSets = NUM_SLOTS;
         if (vkCreateDescriptorPool(device, &pi, nullptr, &descriptorPool) != VK_SUCCESS) {
             printf("[!] Failed to create descriptor pool\n"); 
             return false;
         }
     }
 
-    if (descriptorSet == VK_NULL_HANDLE) {
+    // Allocate descriptor set for this slot if not exists
+    if (slot.descriptorSet == VK_NULL_HANDLE) {
         VkDescriptorSetAllocateInfo ai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
         ai.descriptorPool = descriptorPool; 
         ai.descriptorSetCount = 1; 
         ai.pSetLayouts = &descriptorSetLayout;
-        if (vkAllocateDescriptorSets(device, &ai, &descriptorSet) != VK_SUCCESS) {
-            printf("[!] Failed to allocate descriptor set\n"); 
+        if (vkAllocateDescriptorSets(device, &ai, &slot.descriptorSet) != VK_SUCCESS) {
+            printf("[!] Failed to allocate descriptor set for slot %u\n", slotIndex); 
             return false;
         }
-        descriptorSetNeedsUpdate = true;
+        slot.descriptorNeedsUpdate = true;
     }
 
-    if (descriptorSetNeedsUpdate) {
+    // Update descriptor set if needed
+    if (slot.descriptorNeedsUpdate) {
         VkDescriptorBufferInfo inInfo{ slot.inputBuffer, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo outInfo{ slot.outputBuffer, 0, VK_WHOLE_SIZE };
         VkWriteDescriptorSet writes[2]{};
-        writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &inInfo, nullptr };
-        writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &outInfo, nullptr };
+        writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, slot.descriptorSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &inInfo, nullptr };
+        writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, slot.descriptorSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &outInfo, nullptr };
         vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
-        descriptorSetNeedsUpdate = false;
+        slot.descriptorNeedsUpdate = false;
     }
 
     return true;
 }
 
-bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples) {
+bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples, uint32_t slotIndex) {
+    if (slotIndex >= NUM_SLOTS) {
+        printf("[!] Invalid slot index: %u\n", slotIndex);
+        return false;
+    }
+
+    GpuSlot& slot = slots[slotIndex];
+
+    // Ensure slot is not in-flight
     if (slot.inFlight) {
+        printf("[!] Slot %u still in-flight\n", slotIndex);
         return false;
     }
 
-    VkResult fenceStatus = vkGetFenceStatus(device, slot.fence);
-    if (fenceStatus == VK_NOT_READY) {
-        return false;
+    // Wait for fence if it was previously used (should be signaled already)
+    if (slot.fence != VK_NULL_HANDLE) {
+        VkResult fenceStatus = vkGetFenceStatus(device, slot.fence);
+        if (fenceStatus == VK_NOT_READY) {
+            printf("[!] Slot %u fence not ready (should not happen)\n", slotIndex);
+            return false;
+        }
+        
+        // Reset fence for reuse
+        if (vkResetFences(device, 1, &slot.fence) != VK_SUCCESS) {
+            printf("[!] Failed to reset fence for slot %u\n", slotIndex);
+            return false;
+        }
     }
 
-    if (fenceStatus == VK_SUCCESS) {
-        vkResetFences(device, 1, &slot.fence);
-    }
-
+    // Reset command buffer
     if (vkResetCommandBuffer(slot.commandBuffer, 0) != VK_SUCCESS) {
-        printf("[!] Failed to reset command buffer\n");
+        printf("[!] Failed to reset command buffer for slot %u\n", slotIndex);
         return false;
     }
 
+    // Begin command buffer
     VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
     if (vkBeginCommandBuffer(slot.commandBuffer, &beginInfo) != VK_SUCCESS) {
-        printf("[!] Failed to begin command buffer\n");
+        printf("[!] Failed to begin command buffer for slot %u\n", slotIndex);
         return false;
     }
 
+    // Bind pipeline and descriptor sets
     vkCmdBindPipeline(slot.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
-    vkCmdBindDescriptorSets(slot.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+    vkCmdBindDescriptorSets(slot.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &slot.descriptorSet, 0, nullptr);
 
+    // Set push constants
     PushConstants push{};
     push.inFrameCount = inSamples / numChannels;
     push.outFrameCount = outSamples / numChannels;
     push.ratio = static_cast<float>(static_cast<double>(outRate) / inRate);
     vkCmdPushConstants(slot.commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &push);
 
-    // Memory barriers for CPU-GPU synchronization
-    VkMemoryBarrier inputBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    // Buffer-specific memory barriers for better performance (vs global VkMemoryBarrier)
+    VkBufferMemoryBarrier inputBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
     inputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
     inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    inputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    inputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    inputBarrier.buffer = slot.inputBuffer;
+    inputBarrier.offset = 0;
+    inputBarrier.size = sizeof(float) * inSamples;
 
     vkCmdPipelineBarrier(
         slot.commandBuffer,
         VK_PIPELINE_STAGE_HOST_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         0,
-        1, &inputBarrier,
         0, nullptr,
+        1, &inputBarrier,
         0, nullptr
     );
 
+    // Dispatch compute work
     const uint32_t groupCount = (outSamples + VulkanConfig::WORKGROUP_SIZE - 1) / VulkanConfig::WORKGROUP_SIZE;
     vkCmdDispatch(slot.commandBuffer, groupCount, 1, 1);
 
-    VkMemoryBarrier outputBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    // Output barrier
+    VkBufferMemoryBarrier outputBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
     outputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     outputBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    outputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outputBarrier.buffer = slot.outputBuffer;
+    outputBarrier.offset = 0;
+    outputBarrier.size = sizeof(float) * outSamples;
 
     vkCmdPipelineBarrier(
         slot.commandBuffer,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_PIPELINE_STAGE_HOST_BIT,
         0,
-        1, &outputBarrier,
         0, nullptr,
+        1, &outputBarrier,
         0, nullptr
     );
 
+    // End command buffer
     if (vkEndCommandBuffer(slot.commandBuffer) != VK_SUCCESS) {
-        printf("[!] Failed to record command buffer\n");
+        printf("[!] Failed to record command buffer for slot %u\n", slotIndex);
         return false;
     }
 
+    // Submit to queue with fence
     VkSubmitInfo submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &slot.commandBuffer;
 
     if (vkQueueSubmit(computeQueue, 1, &submit, slot.fence) != VK_SUCCESS) {
-        printf("[!] Failed to submit compute work\n");
+        printf("[!] Failed to submit compute work for slot %u\n", slotIndex);
         return false;
     }
 
+    // Mark slot as in-flight
     slot.inFlight = true;
     return true;
 }
 
 bool VulkanUpsampler::enqueue(const float* input, uint32_t inputFrames) {
-    if (!slot.initialized || shaderModule == VK_NULL_HANDLE) {
+    if (shaderModule == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    if (computePipeline == VK_NULL_HANDLE) {
+        printf("[!] Pipeline not initialized\n");
+        return false;
+    }
+
+    // Find available slot
+    int slotIndex = findAvailableSlot();
+    if (slotIndex < 0) {
+        // All slots busy
+        return false;
+    }
+
+    GpuSlot& slot = slots[slotIndex];
+
+    if (!slot.initialized) {
         return false;
     }
 
@@ -662,33 +816,33 @@ bool VulkanUpsampler::enqueue(const float* input, uint32_t inputFrames) {
     // Calculate skip offset to remove tail's contribution from output
     const uint32_t skipOffset = static_cast<uint32_t>((static_cast<float>(tailSize) / numChannels) * ratio) * numChannels;
 
-    if (!createBuffers(fullInFrames)) {
+    if (!createBuffers(fullInFrames, slotIndex)) {
         return false;
-    }
-
-    if (computePipeline == VK_NULL_HANDLE) {
-        if (!createPipeline(shaderModule)) {
-            return false;
-        }
     }
     
-    if (descriptorSet == VK_NULL_HANDLE || descriptorSetNeedsUpdate) {
-        if (!createDescriptorSet()) {
+    if (slot.descriptorSet == VK_NULL_HANDLE || slot.descriptorNeedsUpdate) {
+        if (!createDescriptorSet(slotIndex)) {
             return false;
         }
     }
 
-    if (!uploadInputToGPU(workingInputBuffer.data(), fullInSamples)) {
+    if (!uploadInputToGPU(workingInputBuffer.data(), fullInSamples, slotIndex)) {
         return false;
     }
 
-    if (!dispatch(fullInSamples, outSamples)) {
+    if (!dispatch(fullInSamples, outSamples, slotIndex)) {
         return false;
     }
 
+    // Track submission order
     slot.sequenceId = nextSequenceId++;
     slot.expectedOutSamples = outSamples;
     slot.skipOffset = skipOffset;
+
+    pendingQueue.push({ static_cast<uint32_t>(slotIndex), slot.sequenceId });
+
+    // Update round-robin index
+    currentSlotIndex = (slotIndex + 1) % NUM_SLOTS;
 
     updateTailBuffer(input, inSamples);
 
@@ -698,39 +852,55 @@ bool VulkanUpsampler::enqueue(const float* input, uint32_t inputFrames) {
 bool VulkanUpsampler::poll(bool& ready, float* output, uint32_t& outputFrames) {
     ready = false;
     
-    if (!slot.inFlight) {
+    // Check if there are any pending works
+    if (pendingQueue.empty()) {
         return true;
     }
 
-    // Use 1ms timeout - proven to work reliably
-    // Shorter timeouts (0 or 100us) can cause fence signal issues on some drivers
-    const uint64_t timeoutNs = 1000000; // 1ms in nanoseconds
-    VkResult waitResult = vkWaitForFences(device, 1, &slot.fence, VK_TRUE, timeoutNs);
+    // Get the oldest pending work (FIFO order)
+    const PendingWork& work = pendingQueue.front();
+    const uint32_t slotIndex = work.slotIndex;
+    GpuSlot& slot = slots[slotIndex];
     
-    if (waitResult == VK_TIMEOUT) {
-        // GPU still working, will try again on next poll
+    if (!slot.inFlight) {
+        // Slot already processed - pop and continue
+        pendingQueue.pop();
+        return true;
+    }
+
+    // Non-blocking fence status check - immediately returns current state
+    VkResult fenceStatus = vkGetFenceStatus(device, slot.fence);
+    
+    if (fenceStatus == VK_NOT_READY) {
+        // GPU still working - return immediately without blocking
         return true;
     }
     
-    if (waitResult != VK_SUCCESS) {
-        printf("[!] Fence wait error: %d\n", waitResult);
+    if (fenceStatus != VK_SUCCESS) {
+        printf("[!] Fence status error for slot %u: %d\n", slotIndex, fenceStatus);
+        slot.inFlight = false;
+        pendingQueue.pop();
         return false;
     }
 
-    // Download results
+    // Fence signaled - GPU work completed, download results
     const uint32_t total = slot.expectedOutSamples;
     if (workingOutputBuffer.capacity() < total) {
         workingOutputBuffer.reserve(total * 2);
     }
     workingOutputBuffer.resize(total);
 
-    if (!downloadOutputFromGPU(workingOutputBuffer.data(), total)) {
+    if (!downloadOutputFromGPU(workingOutputBuffer.data(), total, slotIndex)) {
+        slot.inFlight = false;
+        pendingQueue.pop();
         return false;
     }
 
     // Apply skip offset and copy to output
     if (slot.skipOffset > total) {
-        printf("[!] Skip offset exceeds total output\n");
+        printf("[!] Skip offset %u exceeds total output %u for slot %u\n", slot.skipOffset, total, slotIndex);
+        slot.inFlight = false;
+        pendingQueue.pop();
         return false;
     }
     
@@ -738,14 +908,182 @@ bool VulkanUpsampler::poll(bool& ready, float* output, uint32_t& outputFrames) {
     std::memcpy(output, workingOutputBuffer.data() + slot.skipOffset, sizeof(float) * copySamples);
     outputFrames = copySamples / numChannels;
 
+    // Clear slot state - work complete
     slot.inFlight = false;
+    slot.sequenceId = 0;
+    slot.expectedOutSamples = 0;
+    slot.skipOffset = 0;
+    
+    pendingQueue.pop();
     ready = true;
     return true;
 }
 
-bool VulkanUpsampler::downloadOutputFromGPU(float* output, uint32_t totalSamples) {
+// === Asynchronous API Implementation ===
+
+uint64_t VulkanUpsampler::processAsync(const float* input, uint32_t inputFrames, CompletionCallback callback) {
+    // Check if shader is loaded - silently fail during early initialization
+    if (shaderModule == VK_NULL_HANDLE) [[unlikely]] {
+        return 0;
+    }
+    
+    if (!enqueue(input, inputFrames)) {
+        // Silently fail - this is normal during initialization or when slots are busy
+        return 0;
+    }
+    
+    // Get the most recently submitted work
+    if (!pendingQueue.empty()) {
+        const PendingWork& work = pendingQueue.back();
+        GpuSlot& slot = slots[work.slotIndex];
+        
+        // Store callback for later invocation
+        if (callback) {
+            slot.callback = callback;
+        }
+        
+        return work.sequenceId;
+    }
+    
+    return 0;
+}
+
+size_t VulkanUpsampler::tryPollAll(std::vector<AsyncResult>& results) {
+    size_t completedCount = 0;
+    
+    // Check all pending works (FIFO order)
+    while (!pendingQueue.empty()) {
+        const PendingWork& work = pendingQueue.front();
+        const uint32_t slotIndex = work.slotIndex;
+        GpuSlot& slot = slots[slotIndex];
+        
+        if (!slot.inFlight) {
+            // Already processed
+            pendingQueue.pop();
+            continue;
+        }
+        
+        // Non-blocking check
+        VkResult fenceStatus = vkGetFenceStatus(device, slot.fence);
+        
+        if (fenceStatus == VK_NOT_READY) {
+            // Still processing - stop checking (maintain FIFO order)
+            break;
+        }
+        
+        if (fenceStatus != VK_SUCCESS) {
+            printf("[!] Fence status error for slot %u: %d\n", slotIndex, fenceStatus);
+            
+            AsyncResult errorResult;
+            errorResult.sequenceId = work.sequenceId;
+            errorResult.success = false;
+            errorResult.frameCount = 0;
+            results.push_back(errorResult);
+            
+            slot.inFlight = false;
+            slot.sequenceId = 0;
+            slot.expectedOutSamples = 0;
+            slot.skipOffset = 0;
+            
+            pendingQueue.pop();
+            continue;
+        }
+        
+        // Work completed - download results
+        const uint32_t total = slot.expectedOutSamples;
+        
+        if (workingOutputBuffer.capacity() < total) {
+            workingOutputBuffer.reserve(total * 2);
+        }
+        workingOutputBuffer.resize(total);
+        
+        if (!downloadOutputFromGPU(workingOutputBuffer.data(), total, slotIndex)) {
+            AsyncResult errorResult;
+            errorResult.sequenceId = work.sequenceId;
+            errorResult.success = false;
+            errorResult.frameCount = 0;
+            results.push_back(errorResult);
+            
+            slot.inFlight = false;
+            slot.sequenceId = 0;
+            slot.expectedOutSamples = 0;
+            slot.skipOffset = 0;
+            
+            pendingQueue.pop();
+            continue;
+        }
+        
+        // Apply skip offset
+        if (slot.skipOffset > total) {
+            printf("[!] Skip offset %u exceeds total output %u for slot %u\n", slot.skipOffset, total, slotIndex);
+            
+            AsyncResult errorResult;
+            errorResult.sequenceId = work.sequenceId;
+            errorResult.success = false;
+            errorResult.frameCount = 0;
+            results.push_back(errorResult);
+            
+            slot.inFlight = false;
+            slot.sequenceId = 0;
+            slot.expectedOutSamples = 0;
+            slot.skipOffset = 0;
+            
+            pendingQueue.pop();
+            continue;
+        }
+        
+        const uint32_t copySamples = total - slot.skipOffset;
+        const uint32_t outputFrames = copySamples / numChannels;
+        
+        // Create result
+        AsyncResult result;
+        result.sequenceId = work.sequenceId;
+        result.data.resize(copySamples);
+        std::memcpy(result.data.data(), workingOutputBuffer.data() + slot.skipOffset, sizeof(float) * copySamples);
+        result.frameCount = outputFrames;
+        result.success = true;
+        
+        results.push_back(result);
+        
+        // Invoke callback if registered
+        if (slot.callback) {
+            slot.callback(result.data.data(), outputFrames);
+            slot.callback = nullptr; // Clear after invocation
+        }
+        
+        // Clear slot state - work complete
+        slot.inFlight = false;
+        slot.sequenceId = 0;
+        slot.expectedOutSamples = 0;
+        slot.skipOffset = 0;
+        
+        pendingQueue.pop();
+        ++completedCount;
+    }
+    
+    return completedCount;
+}
+
+size_t VulkanUpsampler::getAvailableSlots() const {
+    size_t available = 0;
+    for (uint32_t i = 0; i < NUM_SLOTS; ++i) {
+        if (!slots[i].inFlight) {
+            ++available;
+        }
+    }
+    return available;
+}
+
+bool VulkanUpsampler::downloadOutputFromGPU(float* output, uint32_t totalSamples, uint32_t slotIndex) {
+    if (slotIndex >= NUM_SLOTS) {
+        printf("[!] Invalid slot index: %u\n", slotIndex);
+        return false;
+    }
+
+    GpuSlot& slot = slots[slotIndex];
+
     if (!slot.outputPtr) [[unlikely]] {
-        printf("[!] Output memory not mapped\n");
+        printf("[!] Output memory not mapped for slot %u\n", slotIndex);
         return false;
     }
 
@@ -758,7 +1096,7 @@ bool VulkanUpsampler::downloadOutputFromGPU(float* output, uint32_t totalSamples
         range.size = sizeof(float) * totalSamples;
 
         if (vkInvalidateMappedMemoryRanges(device, 1, &range) != VK_SUCCESS) {
-            printf("[!] Failed to invalidate output memory\n");
+            printf("[!] Failed to invalidate output memory for slot %u\n", slotIndex);
             return false;
         }
     }
@@ -767,6 +1105,7 @@ bool VulkanUpsampler::downloadOutputFromGPU(float* output, uint32_t totalSamples
     return true;
 }
 
+// === Utility Functions ===
 void VulkanUpsampler::updateTailBuffer(const float* input, uint32_t inSamples) {
     const uint32_t tailStoreSamples = VulkanConfig::MAX_TAIL_FRAMES * numChannels;
     
@@ -776,6 +1115,36 @@ void VulkanUpsampler::updateTailBuffer(const float* input, uint32_t inSamples) {
         previousTail.assign(input, input + inSamples);
     }
 }
+
+int VulkanUpsampler::findAvailableSlot() const {
+    // First, try round-robin from currentSlotIndex to find a slot not in flight
+    for (uint32_t i = 0; i < NUM_SLOTS; ++i) {
+        const uint32_t slotIndex = (currentSlotIndex + i) % NUM_SLOTS;
+        if (!slots[slotIndex].inFlight) {
+            return static_cast<int>(slotIndex);
+        }
+    }
+
+    // All slots marked in-flight - check for completed work using non-blocking fence query
+    for (uint32_t i = 0; i < NUM_SLOTS; ++i) {
+        const uint32_t slotIndex = (currentSlotIndex + i) % NUM_SLOTS;
+        const GpuSlot& slot = slots[slotIndex];
+        
+        if (slot.fence != VK_NULL_HANDLE && slot.inFlight) {
+            VkResult status = vkGetFenceStatus(device, slot.fence);
+            if (status == VK_SUCCESS) {
+                // Note: We don't clear inFlight here - that's done by poll() to maintain ordering
+                // But we can inform the caller this slot will be available soon
+                // For now, we skip this slot and let poll() handle it properly
+                continue;
+            }
+        }
+    }
+
+    return -1; // All slots genuinely busy
+}
+
+// ...existing cleanup functions...
 
 void VulkanUpsampler::cleanupPipeline() {
     if (computePipeline != VK_NULL_HANDLE) {
@@ -793,7 +1162,11 @@ void VulkanUpsampler::cleanupPipeline() {
     if (descriptorPool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
         descriptorPool = VK_NULL_HANDLE;
-        descriptorSet = VK_NULL_HANDLE; // Automatically freed with pool
+        
+        // Descriptor sets are automatically freed with pool
+        for (uint32_t i = 0; i < NUM_SLOTS; ++i) {
+            slots[i].descriptorSet = VK_NULL_HANDLE;
+        }
     }
 }
 

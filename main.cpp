@@ -20,22 +20,21 @@ namespace AudioConfig {
     static constexpr uint32_t INPUT_SAMPLE_RATE = 44100;
     static constexpr uint32_t OUTPUT_SAMPLE_RATE = 384000;
     static constexpr uint32_t CHANNELS = 2;
-    static constexpr uint32_t BUFFER_MULTIPLIER = 4;
-    static constexpr uint32_t MAX_FRAME_MULTIPLIER = 8;
     static constexpr uint32_t PREBUFFER_SAMPLES = OUTPUT_SAMPLE_RATE / 2; // 0.5 seconds
     static constexpr uint32_t SLEEP_INTERVAL_MS = 10;
     static constexpr uint32_t MAIN_LOOP_SLEEP_MS = 100;
     
-    static constexpr uint32_t RING_BUFFER_SAMPLES = OUTPUT_SAMPLE_RATE * BUFFER_MULTIPLIER;
-    static constexpr uint32_t MAX_OUTPUT_FRAMES = INPUT_SAMPLE_RATE * MAX_FRAME_MULTIPLIER;
+    // Use power-of-2 size for optimal ring buffer performance
+    // 2^21 = 2097152 samples ~= 2.73 seconds at 384kHz (was 1536000 = 4 seconds)
+    static constexpr uint32_t RING_BUFFER_SAMPLES = 2097152;
 }
 
 // === Global State ===
 std::atomic<bool> g_running{ true };
 std::atomic<bool> g_underrun{ false };
+std::atomic<bool> g_gpuReady{ false };
 
 static std::unique_ptr<GpuUpsampler> g_upsampler;
-static float outputBuffer[AudioConfig::MAX_OUTPUT_FRAMES * AudioConfig::CHANNELS];
 
 // === Signal Handler ===
 void signal_handler(int signal) {
@@ -146,6 +145,7 @@ public:
         config.playback.format = ma_format_f32;
         config.playback.channels = AudioConfig::CHANNELS;
         config.dataCallback = playback_callback;
+        config.noPreSilencedOutputBuffer = MA_TRUE;  // Prevent pre-initialization testing
 
         if (ma_device_init(nullptr, &config, &playbackDevice) != MA_SUCCESS) {
             printf("[!] Failed to initialize playback device\n");
@@ -239,8 +239,9 @@ void AudioDeviceManager::capture_callback(ma_device* device, void* output, const
     (void)output; // Explicitly mark as unused
     (void)device; // Explicitly mark as unused
 
-    // Check if we're shutting down
-    if (!g_running.load(std::memory_order_acquire)) {
+    // Early exit checks - before any processing
+    if (!g_running.load(std::memory_order_acquire) || 
+        !g_gpuReady.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -249,17 +250,30 @@ void AudioDeviceManager::capture_callback(ma_device* device, void* output, const
     }
 
     const auto* inputSamples = static_cast<const float*>(input);
-    uint32_t outputFrames = 0;
-
-    if (g_upsampler->process(inputSamples, frameCount, outputBuffer, outputFrames)) {
-        const uint32_t outputSamples = outputFrames * AudioConfig::CHANNELS;
-        g_ring.push(outputBuffer, outputSamples);
-    } else [[unlikely]] {
-        // Only log errors if not shutting down
-        if (g_running.load(std::memory_order_acquire)) {
-            printf("[!] GPU processing failed\n");
+    
+    // Cast to VulkanUpsampler to access async API
+    auto* vulkanUpsampler = static_cast<VulkanUpsampler*>(g_upsampler.get());
+    
+    // Submit work asynchronously (non-blocking)
+    uint64_t sequenceId = vulkanUpsampler->processAsync(inputSamples, frameCount, 
+        [](const float* output, uint32_t outputFrames) {
+            // Callback executes when GPU work completes
+            const uint32_t outputSamples = outputFrames * AudioConfig::CHANNELS;
+            g_ring.push(output, outputSamples);
+        });
+    
+    if (sequenceId == 0) [[unlikely]] {
+        // Reduce log spam - only log periodically (skip early failures during init)
+        static thread_local uint32_t errorCount = 0;
+        if (++errorCount >= 10 && errorCount % 100 == 10) {  // Skip first 10 errors, then log every 100th
+            printf("[!] GPU submission failed (all slots busy) - count: %u\n", errorCount);
         }
     }
+    
+    // Poll completed work (non-blocking) - callbacks will be invoked
+    static thread_local std::vector<AsyncResult> results;
+    results.clear();
+    vulkanUpsampler->tryPollAll(results);
 }
 
 void AudioDeviceManager::playback_callback(ma_device* device, void* output, const void* input, ma_uint32 frameCount) {
@@ -309,7 +323,9 @@ void runMainLoop(AudioDeviceManager& deviceManager) {
 int main() {
     std::signal(SIGINT, signal_handler);
 
-    // Initialize GPU upsampler
+    printf("[*] Initializing GPU upsampler...\n");
+    
+    // Step 1: Initialize GPU upsampler
     g_upsampler = std::make_unique<VulkanUpsampler>();
     if (!g_upsampler->initialize(AudioConfig::INPUT_SAMPLE_RATE, 
                                 AudioConfig::OUTPUT_SAMPLE_RATE, 
@@ -318,16 +334,28 @@ int main() {
         return EXIT_FAILURE;
     }
 
+    // Step 2: Load shader
     g_upsampler->setKernel(ResampleKernel::Linear);
+    
+    // Step 3: Initialize ring buffer
     g_ring.init(AudioConfig::RING_BUFFER_SAMPLES);
 
-    // Initialize and start audio devices
+    // Step 4: Mark GPU as ready BEFORE initializing audio devices
+    // This MUST be done before ma_device_init() calls
+    g_gpuReady.store(true, std::memory_order_release);
+    
+    printf("[*] Initializing audio devices...\n");
+    
+    // Step 5: Initialize audio devices (callbacks may be called during init)
     AudioDeviceManager deviceManager;
     if (!deviceManager.initializeCapture() || !deviceManager.initializePlayback()) {
+        g_gpuReady.store(false, std::memory_order_release);
         return EXIT_FAILURE;
     }
 
+    // Step 6: Start devices
     if (!deviceManager.startDevices()) {
+        g_gpuReady.store(false, std::memory_order_release);
         return EXIT_FAILURE;
     }
 
@@ -340,6 +368,9 @@ int main() {
 
     // Graceful shutdown sequence
     printf("[*] Initiating shutdown sequence...\n");
+    
+    // Mark GPU as not ready to stop callbacks
+    g_gpuReady.store(false, std::memory_order_release);
     
     // Step 1: Stop audio devices first to prevent callbacks from running
     deviceManager.stopDevices();

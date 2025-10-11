@@ -22,22 +22,31 @@ void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= pc.outFrameCount * 2) return;
 
-    uint channel = 1 - (gid & 1); // 0 = R, 1 = L (inverted because input is R0,L0,R1,L1 not L0,R0,L1,R1)
+    // Channel and frame index calculation (bit ops are fast)
+    uint channel = 1 - (gid & 1); // 0 = R, 1 = L
     uint outFrameIndex = gid >> 1;
 
+    // Use hardware-accelerated floor/fract
     float inFrameIndex = float(outFrameIndex) / pc.ratio;
-    uint baseFrame = uint(inFrameIndex);
-    float frac = inFrameIndex - float(baseFrame);
+    uint baseFrame = uint(floor(inFrameIndex));
+    float frac = fract(inFrameIndex);
 
-    uint maxSampleIndex = pc.inFrameCount * 2;
-    uint baseIndex = baseFrame * 2 + channel;
-    uint nextIndex = baseIndex + 2;
+    // Safe boundary clamping
+    uint maxFrameIndex = pc.inFrameCount - 1;
+    uint frame0 = min(baseFrame, maxFrameIndex);
+    uint frame1 = min(baseFrame + 1, maxFrameIndex);
+    
+    // Calculate sample indices
+    uint idx0 = frame0 * 2 + channel;
+    uint idx1 = frame1 * 2 + channel;
 
-    // Combined boundary checks for current and next samples
-    float s0 = (baseIndex < maxSampleIndex) ? inSamples[baseIndex] : 0.0;
-    float s1 = (nextIndex < maxSampleIndex) ? inSamples[nextIndex] : s0;
+    // Fetch samples
+    float s0 = inSamples[idx0];
+    float s1 = inSamples[idx1];
 
-    // Linear interpolation with clamp for safety
-    float mixed = fma(frac, s1 - s0, s0);
-    outSamples[gid] = max(-1.0, min(1.0, mixed));
+    // Hardware-accelerated linear interpolation (single MAD instruction)
+    float result = mix(s0, s1, frac);
+    
+    // Hardware-accelerated clamp (fused MIN/MAX)
+    outSamples[gid] = clamp(result, -1.0, 1.0);
 }

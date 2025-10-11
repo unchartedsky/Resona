@@ -11,11 +11,10 @@
 // === Configuration Constants ===
 namespace VulkanConfig {
     static constexpr uint32_t WORKGROUP_SIZE = 64;
-    static constexpr uint32_t MAX_TAIL_FRAMES = 4;
-    static constexpr uint32_t API_VERSION = VK_API_VERSION_1_2;
+    static constexpr uint32_t MAX_TAIL_FRAMES = 16; // Increased from 4 for better boundary handling
+    static constexpr uint32_t API_VERSION = VK_API_VERSION_1_2;  // Support GPUs from ~2017+
     static constexpr float QUEUE_PRIORITY = 1.0f;
-    static constexpr const char* APP_NAME = "VulkanUpsampler";
-    static constexpr const char* ENGINE_NAME = "No Engine";
+    static constexpr const char* APP_NAME = "Resona";
     static constexpr uint64_t FENCE_TIMEOUT = UINT64_MAX;
 }
 
@@ -31,9 +30,15 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
         return false;
     }
 
-    // Initialize all slots
-    VkDeviceSize inputSize = 4096 * sizeof(float);
-    VkDeviceSize outputSize = 8192 * sizeof(float);
+    // OPTIMIZED: Much larger initial buffer sizes to avoid reallocation
+    // Allocate for 2048 frames (worst case for miniaudio callbacks)
+    const float ratio = static_cast<float>(outputRate) / inputRate;
+    const uint32_t maxInputFrames = 2048; // Typical max callback size
+    const uint32_t maxInputSamples = maxInputFrames * channels;
+    const uint32_t maxOutputSamples = static_cast<uint32_t>(maxInputFrames * ratio * 1.1f) * channels; // +10% safety margin
+    
+    VkDeviceSize inputSize = maxInputSamples * sizeof(float);
+    VkDeviceSize outputSize = maxOutputSamples * sizeof(float);
 
     for (uint32_t i = 0; i < NUM_SLOTS; ++i) {
         // Create fence for async synchronization
@@ -44,7 +49,7 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
             return false;
         }
 
-        // Allocate initial GPU buffers
+        // Allocate initial GPU buffers with sufficient size
         if (!createBuffer(inputSize, slots[i].inputBuffer, slots[i].inputMemory, &slots[i].inputPtr, "slot.input")) {
             printf("[!] Failed to create input buffer for slot %u\n", i);
             return false;
@@ -61,16 +66,11 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
         slots[i].initialized = true;
     }
 
-    // Pre-allocate working buffers
-    const float ratio = static_cast<float>(outRate) / inRate;
-    const uint32_t estimatedInputSamples = 2048 * numChannels;
-    const uint32_t estimatedOutputSamples = static_cast<uint32_t>(estimatedInputSamples * ratio);
-    
-    workingInputBuffer.reserve(estimatedInputSamples * 2);
-    workingOutputBuffer.reserve(estimatedOutputSamples * 2);
-    
     printf("[+] VulkanUpsampler initialized: %uHz -> %uHz (%u channels, %u slots)\n", 
            inputRate, outputRate, channels, NUM_SLOTS);
+    printf("[+] Initial buffer capacity: input=%u KB, output=%u KB per slot\n",
+           static_cast<uint32_t>(inputSize / 1024), 
+           static_cast<uint32_t>(outputSize / 1024));
     
     return true;
 }
@@ -142,53 +142,12 @@ void VulkanUpsampler::setKernel(ResampleKernel kernel) {
 }
 
 bool VulkanUpsampler::process(const float* input, uint32_t inputFrames, float* output, uint32_t& outputFrames) {
-    if (!enqueue(input, inputFrames)) {
-        return false;
-    }
-    
-    bool ready = false;
-    // First, try non-blocking polls
-    for (int i = 0; i < 1000 && !ready; ++i) {
-        if (!poll(ready, output, outputFrames)) {
-            return false;
-        }
-        
-        // Early exit if ready
-        if (ready) {
-            return true;
-        }
-        
-        // Small yield to prevent tight spin loop
-        if (i % 10 == 0) {
-            std::this_thread::yield();
-        }
-    }
-    
-    // If still not ready after 1000 iterations, do a blocking wait
-    if (!ready && !pendingQueue.empty()) {
-        const PendingWork& work = pendingQueue.front();
-        GpuSlot& slot = slots[work.slotIndex];
-        
-        if (slot.inFlight && slot.fence != VK_NULL_HANDLE) {
-            // Final blocking wait with timeout
-            const uint64_t timeoutNs = 10000000; // 10ms timeout
-            VkResult waitResult = vkWaitForFences(device, 1, &slot.fence, VK_TRUE, timeoutNs);
-            
-            if (waitResult == VK_SUCCESS) {
-                // Try poll one more time
-                if (!poll(ready, output, outputFrames)) {
-                    return false;
-                }
-            }
-        }
-    }
-    
-    if (!ready) {
-        printf("[!] GPU processing timeout\n");
-        return false;
-    }
-    
-    return true;
+    // Empty stub - deprecated, use processAsync() instead
+    (void)input;
+    (void)inputFrames;
+    (void)output;
+    (void)outputFrames;
+    return false;
 }
 
 void VulkanUpsampler::shutdown() {
@@ -232,8 +191,6 @@ bool VulkanUpsampler::createInstance() {
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = VulkanConfig::APP_NAME;
     appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
-    appInfo.pEngineName = VulkanConfig::ENGINE_NAME;
-    appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VulkanConfig::API_VERSION;
 
     VkInstanceCreateInfo createInfo{};
@@ -450,13 +407,22 @@ bool VulkanUpsampler::createBuffer(VkDeviceSize size, VkBuffer& buffer, VkDevice
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     allocInfo.allocationSize = memRequirements.size;
     
+    // Try to find cached memory first for better performance
     uint32_t memoryTypeIndex;
     try {
         memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, BUFFER_MEMORY_PROPS);
-    } catch (const std::runtime_error& e) {
-        printf("[!] %s for %s buffer\n", e.what(), label);
-        vkDestroyBuffer(device, buffer, nullptr);
-        return false;
+    } catch (const std::runtime_error&) {
+        // Fallback to non-cached if cached not available
+        try {
+            memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, BUFFER_MEMORY_PROPS_FALLBACK);
+            if (strcmp(label, "slot.input") == 0) {
+                printf("[*] Using non-cached memory for %s (cached not available)\n", label);
+            }
+        } catch (const std::runtime_error& e) {
+            printf("[!] %s for %s buffer\n", e.what(), label);
+            vkDestroyBuffer(device, buffer, nullptr);
+            return false;
+        }
     }
     
     allocInfo.memoryTypeIndex = memoryTypeIndex;
@@ -706,49 +672,36 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples, uint32_t
     push.ratio = static_cast<float>(static_cast<double>(outRate) / inRate);
     vkCmdPushConstants(slot.commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &push);
 
-    // Buffer-specific memory barriers for better performance (vs global VkMemoryBarrier)
-    VkBufferMemoryBarrier inputBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
-    inputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-    inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    inputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    inputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    inputBarrier.buffer = slot.inputBuffer;
-    inputBarrier.offset = 0;
-    inputBarrier.size = sizeof(float) * inSamples;
+    // OPTIMIZED: Only input barrier, and only if using non-coherent memory
+    // For coherent memory (typical case), barriers are not needed at all
+    if (!(inputMemoryProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+        VkBufferMemoryBarrier inputBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+        inputBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        inputBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        inputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        inputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        inputBarrier.buffer = slot.inputBuffer;
+        inputBarrier.offset = 0;
+        inputBarrier.size = sizeof(float) * inSamples;
 
-    vkCmdPipelineBarrier(
-        slot.commandBuffer,
-        VK_PIPELINE_STAGE_HOST_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0,
-        0, nullptr,
-        1, &inputBarrier,
-        0, nullptr
-    );
+        vkCmdPipelineBarrier(
+            slot.commandBuffer,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0, nullptr,
+            1, &inputBarrier,
+            0, nullptr
+        );
+    }
 
     // Dispatch compute work
     const uint32_t groupCount = (outSamples + VulkanConfig::WORKGROUP_SIZE - 1) / VulkanConfig::WORKGROUP_SIZE;
     vkCmdDispatch(slot.commandBuffer, groupCount, 1, 1);
 
-    // Output barrier
-    VkBufferMemoryBarrier outputBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
-    outputBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    outputBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    outputBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    outputBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    outputBarrier.buffer = slot.outputBuffer;
-    outputBarrier.offset = 0;
-    outputBarrier.size = sizeof(float) * outSamples;
-
-    vkCmdPipelineBarrier(
-        slot.commandBuffer,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_HOST_BIT,
-        0,
-        0, nullptr,
-        1, &outputBarrier,
-        0, nullptr
-    );
+    // OPTIMIZED: Remove output barrier completely!
+    // The fence wait before CPU reads the data is sufficient synchronization.
+    // Pipeline barriers here only add overhead without benefit.
 
     // End command buffer
     if (vkEndCommandBuffer(slot.commandBuffer) != VK_SUCCESS) {
@@ -795,6 +748,7 @@ bool VulkanUpsampler::enqueue(const float* input, uint32_t inputFrames) {
         return false;
     }
 
+    // Use fixed ratio for consistent audio quality
     const float ratio = static_cast<float>(outRate) / inRate;
     const uint32_t inSamples = inputFrames * numChannels;
 
@@ -804,11 +758,13 @@ bool VulkanUpsampler::enqueue(const float* input, uint32_t inputFrames) {
         return false;
     }
 
-    workingInputBuffer.clear();
-    workingInputBuffer.insert(workingInputBuffer.end(), previousTail.begin(), previousTail.end());
-    workingInputBuffer.insert(workingInputBuffer.end(), input, input + inSamples);
+    // OPTIMIZED: Use temporary vector for combined input (tail + current)
+    std::vector<float> combinedInput;
+    combinedInput.reserve(tailSize + inSamples);
+    combinedInput.insert(combinedInput.end(), previousTail.begin(), previousTail.end());
+    combinedInput.insert(combinedInput.end(), input, input + inSamples);
 
-    const uint32_t fullInSamples = static_cast<uint32_t>(workingInputBuffer.size());
+    const uint32_t fullInSamples = static_cast<uint32_t>(combinedInput.size());
     const uint32_t fullInFrames = fullInSamples / numChannels;
     const uint32_t outFrames = static_cast<uint32_t>(fullInFrames * ratio);
     const uint32_t outSamples = outFrames * numChannels;
@@ -826,7 +782,7 @@ bool VulkanUpsampler::enqueue(const float* input, uint32_t inputFrames) {
         }
     }
 
-    if (!uploadInputToGPU(workingInputBuffer.data(), fullInSamples, slotIndex)) {
+    if (!uploadInputToGPU(combinedInput.data(), fullInSamples, slotIndex)) {
         return false;
     }
 
@@ -885,12 +841,11 @@ bool VulkanUpsampler::poll(bool& ready, float* output, uint32_t& outputFrames) {
 
     // Fence signaled - GPU work completed, download results
     const uint32_t total = slot.expectedOutSamples;
-    if (workingOutputBuffer.capacity() < total) {
-        workingOutputBuffer.reserve(total * 2);
-    }
-    workingOutputBuffer.resize(total);
+    
+    // OPTIMIZED: Use temporary vector for output download
+    std::vector<float> tempOutput(total);
 
-    if (!downloadOutputFromGPU(workingOutputBuffer.data(), total, slotIndex)) {
+    if (!downloadOutputFromGPU(tempOutput.data(), total, slotIndex)) {
         slot.inFlight = false;
         pendingQueue.pop();
         return false;
@@ -905,7 +860,7 @@ bool VulkanUpsampler::poll(bool& ready, float* output, uint32_t& outputFrames) {
     }
     
     const uint32_t copySamples = total - slot.skipOffset;
-    std::memcpy(output, workingOutputBuffer.data() + slot.skipOffset, sizeof(float) * copySamples);
+    std::memcpy(output, tempOutput.data() + slot.skipOffset, sizeof(float) * copySamples);
     outputFrames = copySamples / numChannels;
 
     // Clear slot state - work complete
@@ -948,7 +903,7 @@ uint64_t VulkanUpsampler::processAsync(const float* input, uint32_t inputFrames,
     return 0;
 }
 
-size_t VulkanUpsampler::tryPollAll(std::vector<AsyncResult>& results) {
+size_t VulkanUpsampler::tryPollAll() {
     size_t completedCount = 0;
     
     // Check all pending works (FIFO order)
@@ -974,59 +929,64 @@ size_t VulkanUpsampler::tryPollAll(std::vector<AsyncResult>& results) {
         if (fenceStatus != VK_SUCCESS) {
             printf("[!] Fence status error for slot %u: %d\n", slotIndex, fenceStatus);
             
-            AsyncResult errorResult;
-            errorResult.sequenceId = work.sequenceId;
-            errorResult.success = false;
-            errorResult.frameCount = 0;
-            results.push_back(errorResult);
-            
+            // Clear slot state and continue
             slot.inFlight = false;
             slot.sequenceId = 0;
             slot.expectedOutSamples = 0;
             slot.skipOffset = 0;
+            slot.callback = nullptr;
             
             pendingQueue.pop();
             continue;
         }
         
-        // Work completed - download results
+        // ZERO-COPY OPTIMIZATION: Work completed - process directly from GPU memory
         const uint32_t total = slot.expectedOutSamples;
         
-        if (workingOutputBuffer.capacity() < total) {
-            workingOutputBuffer.reserve(total * 2);
-        }
-        workingOutputBuffer.resize(total);
-        
-        if (!downloadOutputFromGPU(workingOutputBuffer.data(), total, slotIndex)) {
-            AsyncResult errorResult;
-            errorResult.sequenceId = work.sequenceId;
-            errorResult.success = false;
-            errorResult.frameCount = 0;
-            results.push_back(errorResult);
+        if (!slot.outputPtr) [[unlikely]] {
+            printf("[!] Output memory not mapped for slot %u\n", slotIndex);
             
             slot.inFlight = false;
             slot.sequenceId = 0;
             slot.expectedOutSamples = 0;
             slot.skipOffset = 0;
+            slot.callback = nullptr;
             
             pendingQueue.pop();
             continue;
         }
         
-        // Apply skip offset
+        // OPTIMIZED: Only invalidate if memory is non-coherent
+        if (!(outputMemoryProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            VkMappedMemoryRange range{};
+            range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+            range.memory = slot.outputMemory;
+            range.offset = 0;
+            range.size = sizeof(float) * total;
+
+            if (vkInvalidateMappedMemoryRanges(device, 1, &range) != VK_SUCCESS) {
+                printf("[!] Failed to invalidate output memory for slot %u\n", slotIndex);
+                
+                slot.inFlight = false;
+                slot.sequenceId = 0;
+                slot.expectedOutSamples = 0;
+                slot.skipOffset = 0;
+                slot.callback = nullptr;
+                
+                pendingQueue.pop();
+                continue;
+            }
+        }
+        
+        // Apply skip offset validation
         if (slot.skipOffset > total) {
             printf("[!] Skip offset %u exceeds total output %u for slot %u\n", slot.skipOffset, total, slotIndex);
             
-            AsyncResult errorResult;
-            errorResult.sequenceId = work.sequenceId;
-            errorResult.success = false;
-            errorResult.frameCount = 0;
-            results.push_back(errorResult);
-            
             slot.inFlight = false;
             slot.sequenceId = 0;
             slot.expectedOutSamples = 0;
             slot.skipOffset = 0;
+            slot.callback = nullptr;
             
             pendingQueue.pop();
             continue;
@@ -1035,20 +995,10 @@ size_t VulkanUpsampler::tryPollAll(std::vector<AsyncResult>& results) {
         const uint32_t copySamples = total - slot.skipOffset;
         const uint32_t outputFrames = copySamples / numChannels;
         
-        // Create result
-        AsyncResult result;
-        result.sequenceId = work.sequenceId;
-        result.data.resize(copySamples);
-        std::memcpy(result.data.data(), workingOutputBuffer.data() + slot.skipOffset, sizeof(float) * copySamples);
-        result.frameCount = outputFrames;
-        result.success = true;
-        
-        results.push_back(result);
-        
-        // Invoke callback if registered
+        // ZERO-COPY: Invoke callback directly with GPU memory pointer (offset applied)
         if (slot.callback) {
-            slot.callback(result.data.data(), outputFrames);
-            slot.callback = nullptr; // Clear after invocation
+            const float* outputPtr = static_cast<const float*>(slot.outputPtr) + slot.skipOffset;
+            slot.callback(outputPtr, outputFrames);
         }
         
         // Clear slot state - work complete
@@ -1056,6 +1006,7 @@ size_t VulkanUpsampler::tryPollAll(std::vector<AsyncResult>& results) {
         slot.sequenceId = 0;
         slot.expectedOutSamples = 0;
         slot.skipOffset = 0;
+        slot.callback = nullptr;
         
         pendingQueue.pop();
         ++completedCount;
@@ -1087,7 +1038,8 @@ bool VulkanUpsampler::downloadOutputFromGPU(float* output, uint32_t totalSamples
         return false;
     }
 
-    // Invalidate cache if non-coherent
+    // OPTIMIZED: Only invalidate if memory is non-coherent
+    // For coherent memory (typical case), fence wait is sufficient
     if (!(outputMemoryProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
         VkMappedMemoryRange range{};
         range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
@@ -1100,6 +1052,7 @@ bool VulkanUpsampler::downloadOutputFromGPU(float* output, uint32_t totalSamples
             return false;
         }
     }
+    // For coherent memory, the fence wait already ensures visibility
 
     std::memcpy(output, slot.outputPtr, sizeof(float) * totalSamples);
     return true;
@@ -1116,8 +1069,8 @@ void VulkanUpsampler::updateTailBuffer(const float* input, uint32_t inSamples) {
     }
 }
 
-int VulkanUpsampler::findAvailableSlot() const {
-    // First, try round-robin from currentSlotIndex to find a slot not in flight
+int VulkanUpsampler::findAvailableSlot() {
+    // First pass: Try round-robin from currentSlotIndex to find a slot not in flight
     for (uint32_t i = 0; i < NUM_SLOTS; ++i) {
         const uint32_t slotIndex = (currentSlotIndex + i) % NUM_SLOTS;
         if (!slots[slotIndex].inFlight) {
@@ -1125,26 +1078,72 @@ int VulkanUpsampler::findAvailableSlot() const {
         }
     }
 
-    // All slots marked in-flight - check for completed work using non-blocking fence query
+    // Second pass: All slots marked in-flight - actively reclaim completed work
+    // CRITICAL FIX: We need to clear completed work immediately, not wait for poll()
     for (uint32_t i = 0; i < NUM_SLOTS; ++i) {
         const uint32_t slotIndex = (currentSlotIndex + i) % NUM_SLOTS;
-        const GpuSlot& slot = slots[slotIndex];
+        GpuSlot& slot = slots[slotIndex];
         
         if (slot.fence != VK_NULL_HANDLE && slot.inFlight) {
             VkResult status = vkGetFenceStatus(device, slot.fence);
             if (status == VK_SUCCESS) {
-                // Note: We don't clear inFlight here - that's done by poll() to maintain ordering
-                // But we can inform the caller this slot will be available soon
-                // For now, we skip this slot and let poll() handle it properly
-                continue;
+                // Work completed! Process it immediately and return this slot
+                // This is critical - poll thread might be too slow or blocked
+                
+                // ZERO-COPY: Invoke callback directly with GPU memory if callback exists
+                if (slot.expectedOutSamples > 0 && slot.callback) {
+                    const uint32_t total = slot.expectedOutSamples;
+                    
+                    if (slot.outputPtr) {
+                        // OPTIMIZED: Only invalidate if memory is non-coherent
+                        if (!(outputMemoryProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                            VkMappedMemoryRange range{};
+                            range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+                            range.memory = slot.outputMemory;
+                            range.offset = 0;
+                            range.size = sizeof(float) * total;
+                            vkInvalidateMappedMemoryRanges(device, 1, &range);
+                        }
+                        
+                        // Apply skip offset and invoke callback with direct pointer
+                        if (slot.skipOffset <= total) {
+                            const uint32_t copySamples = total - slot.skipOffset;
+                            const uint32_t outputFrames = copySamples / numChannels;
+                            
+                            // ZERO-COPY: Pass GPU memory pointer directly (no intermediate copy!)
+                            const float* outputPtr = static_cast<const float*>(slot.outputPtr) + slot.skipOffset;
+                            slot.callback(outputPtr, outputFrames);
+                        }
+                    }
+                }
+                
+                // Clear callback and mark as available
+                slot.callback = nullptr;
+                slot.inFlight = false;
+                slot.sequenceId = 0;
+                slot.expectedOutSamples = 0;
+                slot.skipOffset = 0;
+                
+                // CRITICAL: Also remove from pending queue to prevent polling thread from re-processing
+                // This prevents race conditions and ensures clean state
+                std::queue<PendingWork> newQueue;
+                while (!pendingQueue.empty()) {
+                    const PendingWork& work = pendingQueue.front();
+                    if (work.slotIndex != slotIndex) {
+                        newQueue.push(work);
+                    }
+                    pendingQueue.pop();
+                }
+                pendingQueue = std::move(newQueue);
+                
+                // Return this slot immediately for reuse
+                return static_cast<int>(slotIndex);
             }
         }
     }
 
-    return -1; // All slots genuinely busy
+    return -1; // All slots genuinely busy (GPU still processing)
 }
-
-// ...existing cleanup functions...
 
 void VulkanUpsampler::cleanupPipeline() {
     if (computePipeline != VK_NULL_HANDLE) {

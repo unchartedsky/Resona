@@ -39,27 +39,24 @@ struct GpuSlot {
 };
 
 /**
- * @brief Result structure for async completion
- */
-struct AsyncResult {
-    uint64_t sequenceId;
-    std::vector<float> data;
-    uint32_t frameCount;
-    bool success;
-};
-
-/**
  * @brief Vulkan-based GPU audio upsampler implementation.
  */
 class VulkanUpsampler : public GpuUpsampler {
 public:
+    // ZERO-COPY OPTIMIZATION: Callback receives direct pointer to GPU-mapped memory
+    // WARNING: Pointer is only valid during callback execution!
+    // Data must be consumed or copied within callback before returning.
     using CompletionCallback = std::function<void(const float* output, uint32_t outputFrames)>;
+
+    // === Multi-Slot Configuration ===
+    static constexpr uint32_t NUM_SLOTS = 10;  // Increased from 7
 
     bool initialize(uint32_t inputRate, uint32_t outputRate, uint32_t channels) override;
     
     void setKernel(ResampleKernel kernel) override;
     
-    // === Synchronous API (backward compatible) ===
+    // === Synchronous API (deprecated - empty stub) ===
+    [[deprecated("Use processAsync() for better performance and non-blocking operation")]]
     bool process(const float* input, uint32_t inputFrames, float* output, uint32_t& outputFrames) override;
     
     // === Asynchronous API (new) ===
@@ -71,13 +68,9 @@ public:
     /// @return Sequence ID for tracking, or 0 on failure
     uint64_t processAsync(const float* input, uint32_t inputFrames, CompletionCallback callback = nullptr);
     
-    /// @brief Check all pending work without blocking (event-driven friendly)
-    /// @param results Vector to store completed results
-    /// @return Number of completed works
-    size_t tryPollAll(std::vector<AsyncResult>& results);
-    
-    /// @brief Get number of pending works
-    size_t getPendingCount() const { return pendingQueue.size(); }
+    /// @brief Poll and process all completed work without blocking
+    /// @return Number of completed works processed
+    size_t tryPollAll();
     
     /// @brief Get number of available slots
     size_t getAvailableSlots() const;
@@ -92,9 +85,6 @@ public:
     VkShaderModule createShaderModule(const std::string& filename);
 
 private:
-    // === Multi-Slot Configuration ===
-    static constexpr uint32_t NUM_SLOTS = 3;  // Change this to adjust parallel capacity
-
     // === Initialization and Cleanup ===
     
     /// @brief Initialize Vulkan instance, device, and command objects
@@ -157,16 +147,25 @@ private:
 
     // === Slot Management ===
     
-    /// @brief Find an available slot (not in-flight)
+    /// @brief Find an available slot (not in-flight), actively reclaiming completed work if needed
     /// @return Slot index, or -1 if all slots are busy
-    int findAvailableSlot() const;
+    int findAvailableSlot();
 
     // === Utility Functions ===
     void updateTailBuffer(const float* input, uint32_t inSamples);
 
     // === Constants ===
     static constexpr uint32_t DEFAULT_CHANNELS = 2;
+    
+    // OPTIMIZED: Use HOST_VISIBLE + HOST_CACHED for better CPU read performance
+    // HOST_CACHED dramatically improves CPU->GPU and GPU->CPU transfer speeds
     static constexpr VkMemoryPropertyFlags BUFFER_MEMORY_PROPS = 
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | 
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+        VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    
+    // Fallback without CACHED flag if not available
+    static constexpr VkMemoryPropertyFlags BUFFER_MEMORY_PROPS_FALLBACK = 
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
     /**
@@ -186,13 +185,9 @@ private:
     
     std::vector<float> previousTail;
 
-    // === Performance Buffers ===
-    std::vector<float> workingInputBuffer;   ///< Reusable buffer for input processing
-    std::vector<float> workingOutputBuffer;  ///< Reusable buffer for output processing
-
     // === Memory Management ===
-    VkMemoryPropertyFlags inputMemoryProperties = BUFFER_MEMORY_PROPS;
-    VkMemoryPropertyFlags outputMemoryProperties = BUFFER_MEMORY_PROPS;
+    VkMemoryPropertyFlags inputMemoryProperties = BUFFER_MEMORY_PROPS_FALLBACK;
+    VkMemoryPropertyFlags outputMemoryProperties = BUFFER_MEMORY_PROPS_FALLBACK;
 
     // === Core Vulkan Objects ===
     VkInstance instance = VK_NULL_HANDLE;

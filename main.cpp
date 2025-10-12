@@ -36,115 +36,41 @@ namespace AudioConfig {
     static constexpr uint32_t OUTPUT_SAMPLE_RATE = 384000;
     static constexpr uint32_t CHANNELS = 2;
     
-    // OPTIMIZED: Request small period for lower latency (driver may override)
-    // Windows typically enforces 10ms (441 frames @ 44.1kHz) regardless of request
-    static constexpr uint32_t CAPTURE_PERIOD_SIZE = 64;   // Requested, not guaranteed
-    static constexpr uint32_t CAPTURE_PERIODS = 3;        // Driver default (most common)
+    // DUAL BUFFER ARCHITECTURE:
+    // Input buffer: Stores captured 44.1kHz audio (fast writes from capture callback)
+    // Output buffer: Stores upsampled 384kHz audio (reads from playback callback)
     
-    // OPTIMIZED: Reduced prebuffer for faster startup
-    // 250ms is sufficient for most scenarios, much faster than 500ms
-    static constexpr uint32_t PREBUFFER_SAMPLES = OUTPUT_SAMPLE_RATE * 25 / 100; // 250ms
+    // OPTIMIZED: Power-of-2 buffer sizes for optimal modulo performance
+    // Input buffer: 2 seconds @ 44.1kHz = ~88200 frames -> round up to 131072 (2^17)
+    static constexpr uint32_t INPUT_RING_BUFFER_FRAMES = 131072; // Power of 2 (2^17 = 131072 frames)
+    
+    // Output buffer: 2 seconds @ 384kHz = ~768000 frames -> round up to 1048576 (2^20)
+    static constexpr uint32_t OUTPUT_RING_BUFFER_FRAMES = 1048576; // Power of 2 (2^20 = 1048576 frames)
+    
+    // OPTIMIZED: Increased prebuffer to 400ms for stable startup (prevent initial underrun)
+    static constexpr uint32_t PREBUFFER_FRAMES = OUTPUT_SAMPLE_RATE * 40 / 100; // 400ms @ 384kHz
 
-    // CRITICAL: Higher safety threshold to prevent underruns
-    static constexpr uint32_t MIN_BUFFER_SAMPLES = OUTPUT_SAMPLE_RATE * 25 / 100; // 250ms (increased from 150ms)
+    // CRITICAL: Safety threshold to prevent underruns
+    static constexpr uint32_t MIN_BUFFER_FRAMES = OUTPUT_SAMPLE_RATE * 25 / 100; // 250ms @ 384kHz
 
     static constexpr uint32_t SLEEP_INTERVAL_MS = 5;
-    
-    // Main loop sleep interval - short sleep to remain responsive while yielding CPU
     static constexpr uint32_t MAIN_LOOP_SLEEP_MS = 10;
-
-    // CRITICAL: Ring buffer for stability
-    // 2^20 = 1,048,576 samples = ~2.73 seconds @ 384kHz (4MB RAM)
-    // This handles ~32 minutes of 1400 samples/sec drift
-    static constexpr uint32_t RING_BUFFER_SAMPLES = 1048576;
+    
+    // GPU processing thread sleep interval when no work available
+    static constexpr uint32_t GPU_THREAD_SLEEP_MS = 1;
 }
 
 // === Global State ===
 std::atomic<bool> g_running{ true };
 std::atomic<bool> g_underrun{ false };
+std::atomic<bool> g_cpuReady{ false };
 std::atomic<bool> g_gpuReady{ false };
-std::atomic<uint64_t> g_droppedFrames{ 0 }; // Track frames dropped due to GPU slot exhaustion
+std::atomic<uint64_t> g_capturedInputFrames{ 0 }; // Track total captured input frames
 std::atomic<uint64_t> g_processedInputFrames{ 0 }; // Track total processed input frames
-std::atomic<uint64_t> g_processedOutputSamples{ 0 }; // Track total output samples added to ring buffer
+std::atomic<uint64_t> g_processedOutputFrames{ 0 }; // Track total output frames added to output buffer
+std::atomic<uint64_t> g_playedOutputFrames{ 0 }; // Track total output frames played
 
 static std::unique_ptr<GpuUpsampler> g_upsampler;
-
-// === GPU Polling Thread ===
-class GpuPollerThread {
-public:
-    void start() {
-        if (running) return;
-        
-        running = true;
-        thread = std::thread([this]() {
-            // Set high priority for polling thread
-            #ifdef _WIN32
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-            #endif
-
-            uint32_t spinCount = 0;
-            
-            while (running) {
-                if (!g_gpuReady.load(std::memory_order_acquire) || !g_upsampler) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    continue;
-                }
-                
-                auto* vulkanUpsampler = static_cast<VulkanUpsampler*>(g_upsampler.get());
-                
-                // Ultra-aggressive polling with spinlock behavior
-                size_t completed = vulkanUpsampler->tryPollAll();
-
-                if (completed > 0) {
-                    spinCount = 0;
-                    // Continue immediately - don't sleep when there's work
-                    continue;
-                }
-                
-                // No work completed - only yield CPU briefly to prevent 100% usage
-                ++spinCount;
-                
-                // ULTRA-OPTIMIZED: Pure spinlock for first 1000 iterations
-                // Only yield CPU every 1000 iterations to keep latency minimal
-                if (spinCount % 1000 == 0) {
-                    std::this_thread::yield();
-                    
-                    // After many spins, add tiny sleep to prevent CPU saturation
-                    if (spinCount > 10000) {
-                        std::this_thread::sleep_for(std::chrono::microseconds(1));
-                    }
-                }
-            }
-        });
-    }
-    
-    void stop() {
-        if (!running) return;
-        
-        running = false;
-        if (thread.joinable()) {
-            thread.join();
-        }
-    }
-    
-    ~GpuPollerThread() {
-        stop();
-    }
-    
-private:
-    std::atomic<bool> running{false};
-    std::thread thread;
-};
-
-static GpuPollerThread g_poller;
-
-// === Signal Handler ===
-void signal_handler(int signal) {
-    if (signal == SIGINT) {
-        printf("\n[!] Caught Ctrl+C, shutting down...\n");
-        g_running = false;
-    }
-}
 
 // === Improved Ring Buffer ===
 class FloatRingBuffer {
@@ -154,8 +80,14 @@ public:
         size = totalSamples;
         
         // Check if size is power of 2 for optimal performance
-        if ((size & (size - 1)) != 0) {
+        const bool isPowerOf2 = (size & (size - 1)) == 0;
+        if (!isPowerOf2) {
             printf("[!] Warning: Ring buffer size is not power of 2, performance may be suboptimal\n");
+        } else {
+            // For power-of-2 sizes, we can use fast bitwise AND instead of modulo
+            sizeMask = size - 1;
+            useFastModulo = true;
+            printf("[+] Ring buffer using fast power-of-2 modulo optimization\n");
         }
         
         printf("[+] Ring buffer initialized: %u samples (%.1f KB)\n", 
@@ -169,7 +101,9 @@ public:
         }
         
         const uint32_t writeIdx = writePos.load(std::memory_order_relaxed);
-        const uint32_t writeOffset = writeIdx % size;
+        
+        // OPTIMIZED: Use fast bitwise AND for power-of-2 sizes
+        const uint32_t writeOffset = useFastModulo ? (writeIdx & sizeMask) : (writeIdx % size);
         
         // Prefetch next cache line for better performance
         if (count > 64) { // Only for larger transfers
@@ -200,7 +134,8 @@ public:
             return 0;
         }
 
-        const uint32_t readOffset = readIdx % size;
+        // OPTIMIZED: Use fast bitwise AND for power-of-2 sizes
+        const uint32_t readOffset = useFastModulo ? (readIdx & sizeMask) : (readIdx % size);
         
         // Prefetch next cache line for better performance
         if (toRead > 64) { // Only for larger transfers
@@ -228,12 +163,199 @@ public:
 
 private:
     std::vector<float> buffer;
-    std::atomic<uint32_t> writePos{0};
-    std::atomic<uint32_t> readPos{0};
+    
+    // Cache-line aligned atomics to prevent false sharing
+    // Warning C4324: structure was padded due to alignment specifier - this is intentional
+#ifdef _MSC_VER
+    #pragma warning(push)
+    #pragma warning(disable: 4324)
+#endif
+    alignas(64) std::atomic<uint32_t> writePos{0};
+    alignas(64) std::atomic<uint32_t> readPos{0};
+#ifdef _MSC_VER
+    #pragma warning(pop)
+#endif
+    
     uint32_t size{0};
+    uint32_t sizeMask{0};  // For fast power-of-2 modulo (size - 1)
+    bool useFastModulo{false};
 };
 
-static FloatRingBuffer g_ring;
+// === Dual Ring Buffers ===
+static FloatRingBuffer g_inputRing;  // 44.1kHz captured audio
+static FloatRingBuffer g_outputRing; // 384kHz upsampled audio
+
+// === GPU Processing Thread ===
+class GpuProcessingThread {
+public:
+    void start() {
+        if (running) return;
+        
+        running = true;
+        thread = std::thread([this]() {
+            // Set high priority for GPU processing thread
+            #ifdef _WIN32
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            #endif
+
+            printf("[+] GPU processing thread started (adaptive mode)\n");
+            
+            // Reusable buffer (will grow as needed)
+            std::vector<float> inputBuffer;
+            
+            while (running) {
+                if (!g_gpuReady.load(std::memory_order_acquire) || !g_upsampler) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    continue;
+                }
+                
+                auto* vulkanUpsampler = static_cast<VulkanUpsampler*>(g_upsampler.get());
+                
+                // === ADAPTIVE BATCH SIZING ===
+                // Update adaptive parameters based on current buffer state
+                const uint32_t outputBufferFrames = g_outputRing.available() / AudioConfig::CHANNELS;
+                const uint32_t targetBufferFrames = AudioConfig::OUTPUT_RING_BUFFER_FRAMES / 2; // Target 50% full
+                
+                vulkanUpsampler->updateAdaptiveParams(outputBufferFrames, targetBufferFrames);
+                
+                // Get recommended batch size based on buffer pressure
+                const uint32_t batchFrames = vulkanUpsampler->getRecommendedBatchSize();
+                const uint32_t batchSamples = batchFrames * AudioConfig::CHANNELS;
+                
+                // OPTIMIZATION: Submit multiple batches when buffer is low and slots are available
+                const size_t availableSlots = vulkanUpsampler->getAvailableSlots();
+                const float bufferRatio = static_cast<float>(outputBufferFrames) / targetBufferFrames;
+                
+                // Determine how many batches to submit based on buffer state and available slots
+                uint32_t batchesToSubmit = 1;
+                if (bufferRatio < 0.3f && availableSlots > 3) {
+                    // Critical: Submit as many batches as we can (up to 4)
+                    batchesToSubmit = std::min(static_cast<uint32_t>(availableSlots), 4u);
+                } else if (bufferRatio < 0.5f && availableSlots > 2) {
+                    // Low: Submit 2-3 batches
+                    batchesToSubmit = std::min(static_cast<uint32_t>(availableSlots), 3u);
+                } else if (availableSlots > 1) {
+                    // Normal: Submit 1-2 batches
+                    batchesToSubmit = std::min(static_cast<uint32_t>(availableSlots), 2u);
+                }
+                
+                // Check if we have enough input data to process all batches
+                const uint32_t availableInputFrames = g_inputRing.available() / AudioConfig::CHANNELS;
+                const uint32_t totalRequiredFrames = batchFrames * batchesToSubmit;
+                
+                if (availableInputFrames < totalRequiredFrames) {
+                    // Adjust batches to available input
+                    batchesToSubmit = std::max(1u, availableInputFrames / batchFrames);
+                    
+                    if (batchesToSubmit == 0) {
+                        // Not enough input data - wait a bit
+                        std::this_thread::sleep_for(std::chrono::milliseconds(AudioConfig::GPU_THREAD_SLEEP_MS));
+                        continue;
+                    }
+                }
+                
+                // Check if output buffer has space (prevent overflow)
+                const uint32_t outputFreeFrames = AudioConfig::OUTPUT_RING_BUFFER_FRAMES - outputBufferFrames;
+                const float ratio = static_cast<float>(AudioConfig::OUTPUT_SAMPLE_RATE) / AudioConfig::INPUT_SAMPLE_RATE;
+                const uint32_t expectedOutputFrames = static_cast<uint32_t>(batchFrames * ratio);
+                const uint32_t totalExpectedOutput = expectedOutputFrames * batchesToSubmit;
+                
+                if (outputFreeFrames < totalExpectedOutput) {
+                    // Output buffer nearly full - wait for playback to drain it
+                    std::this_thread::sleep_for(std::chrono::milliseconds(AudioConfig::GPU_THREAD_SLEEP_MS));
+                    continue;
+                }
+                
+                // Resize input buffer if needed
+                const uint32_t maxBatchSamples = batchSamples * batchesToSubmit;
+                if (inputBuffer.size() < maxBatchSamples) {
+                    inputBuffer.resize(maxBatchSamples);
+                }
+                
+                // Submit multiple batches
+                uint32_t successfulSubmissions = 0;
+                for (uint32_t i = 0; i < batchesToSubmit; ++i) {
+                    // Read input data from input ring buffer
+                    const uint32_t readSamples = g_inputRing.pop(inputBuffer.data() + (i * batchSamples), batchSamples);
+                    const uint32_t readFrames = readSamples / AudioConfig::CHANNELS;
+                    
+                    if (readFrames == 0) {
+                        break;
+                    }
+                    
+                    // Submit to GPU for processing (async)
+                    uint64_t sequenceId = vulkanUpsampler->processAsync(inputBuffer.data() + (i * batchSamples), readFrames,
+                        [readFrames](const float* output, uint32_t outputFrames) {
+                            // Callback executes when GPU work completes
+                            const uint32_t outputSamples = outputFrames * AudioConfig::CHANNELS;
+                            g_outputRing.push(output, outputSamples);
+                            
+                            // Track processing statistics
+                            g_processedInputFrames.fetch_add(readFrames, std::memory_order_relaxed);
+                            g_processedOutputFrames.fetch_add(outputFrames, std::memory_order_relaxed);
+                        });
+                    
+                    if (sequenceId != 0) {
+                        successfulSubmissions++;
+                    } else {
+                        // Failed to submit - GPU slots busy, stop trying
+                        break;
+                    }
+                }
+                
+                // Poll for completed work (non-blocking)
+                vulkanUpsampler->tryPollAll();
+                
+                // Adaptive sleep: sleep less when buffer is low, more when buffer is high
+                uint32_t sleepMs = 0;
+                
+                if (bufferRatio < 0.3f) {
+                    // Critical: No sleep - process as fast as possible
+                    sleepMs = 0;
+                } else if (bufferRatio < 0.6f) {
+                    // Medium: Short sleep
+                    sleepMs = 1;
+                } else {
+                    // Healthy: Normal sleep
+                    sleepMs = AudioConfig::GPU_THREAD_SLEEP_MS;
+                }
+                
+                if (sleepMs > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+                }
+            }
+            
+            printf("[+] GPU processing thread stopped\n");
+        });
+    }
+    
+    void stop() {
+        if (!running) return;
+        
+        running = false;
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    
+    ~GpuProcessingThread() {
+        stop();
+    }
+    
+private:
+    std::atomic<bool> running{false};
+    std::thread thread;
+};
+
+static GpuProcessingThread g_gpuProcessor;
+
+// === Signal Handler ===
+void signal_handler(int signal) {
+    if (signal == SIGINT) {
+        printf("\n[!] Caught Ctrl+C, shutting down...\n");
+        g_running = false;
+    }
+}
 
 // === RAII Audio Device Manager ===
 class AudioDeviceManager {
@@ -249,17 +371,22 @@ public:
         config.capture.channels = AudioConfig::CHANNELS;
         config.dataCallback = capture_callback;
 
-        // CRITICAL: Disable ALL miniaudio resampling and conversion
+        // === Performance Optimizations ===
+        
+        // Disable miniaudio resampling and conversion (already done, keep these)
         config.noPreSilencedOutputBuffer = MA_TRUE;
         config.noClip = MA_TRUE;
-        config.noFixedSizedCallback = MA_TRUE;  // Allow variable-size callbacks from hardware
-
-        // Request low-latency period size (driver will use closest supported value)
-        config.periodSizeInFrames = AudioConfig::CAPTURE_PERIOD_SIZE;
-        config.periods = AudioConfig::CAPTURE_PERIODS;
+        config.noFixedSizedCallback = MA_TRUE;
         
-        // Request low-latency/performance mode
+        // NEW: Set performance profile for low latency
         config.performanceProfile = ma_performance_profile_low_latency;
+        
+        // NEW: WASAPI-specific optimizations (Windows only)
+        #ifdef MA_WIN32
+        config.wasapi.noAutoConvertSRC = MA_TRUE;  // Disable WASAPI's sample rate converter
+        config.wasapi.noDefaultQualitySRC = MA_TRUE;  // Disable quality SRC for speed
+        config.wasapi.noHardwareOffloading = MA_FALSE;  // Allow hardware offloading
+        #endif
 
         if (ma_device_init(nullptr, &config, &captureDevice) != MA_SUCCESS) {
             printf("[!] Failed to initialize capture device\n");
@@ -268,7 +395,6 @@ public:
         
         // Set high priority for capture thread (Windows)
         #ifdef _WIN32
-        // Wait a moment for thread to be created
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         
         HANDLE threadHandle = (HANDLE)captureDevice.thread;
@@ -295,14 +421,6 @@ public:
         printf("[+] Capture callback: %.1f Hz (every %.2f ms)\n", 
                callbackFrequency, callbackIntervalMs);
         
-        // Provide helpful information if period size is larger than requested
-        if (captureDevice.capture.internalPeriodSizeInFrames > AudioConfig::CAPTURE_PERIOD_SIZE * 2) {
-            printf("[*] Note: Driver enforced period size (%u frames) is larger than requested (%u frames)\n",
-                   captureDevice.capture.internalPeriodSizeInFrames,
-                   AudioConfig::CAPTURE_PERIOD_SIZE);
-            printf("[*] This is normal for Windows audio. For lower latency, consider ASIO drivers.\n");
-        }
-        
         captureInitialized = true;
         return true;
     }
@@ -314,10 +432,25 @@ public:
         config.playback.channels = AudioConfig::CHANNELS;
         config.dataCallback = playback_callback;
 
-        // CRITICAL: Disable ALL miniaudio resampling and conversion
+        // === Performance Optimizations ===
+        
+        // Disable ALL miniaudio resampling and conversion
         config.noPreSilencedOutputBuffer = MA_TRUE;
         config.noClip = MA_TRUE;
         config.noFixedSizedCallback = MA_TRUE;  // Allow variable-size callbacks
+        
+        // NEW: Set performance profile for low latency
+        config.performanceProfile = ma_performance_profile_low_latency;
+        
+        // NEW: WASAPI-specific optimizations (Windows only)
+        #ifdef MA_WIN32
+        config.wasapi.noAutoConvertSRC = MA_TRUE;  // Disable WASAPI's sample rate converter
+        config.wasapi.noDefaultQualitySRC = MA_TRUE;  // Disable quality SRC for speed
+        config.wasapi.noHardwareOffloading = MA_FALSE;  // Allow hardware offloading
+        
+        // NEW: Try to use exclusive mode for lowest latency (may fail, that's OK)
+        config.wasapi.usage = ma_wasapi_usage_pro_audio;  // Pro audio usage hint
+        #endif
         
         if (ma_device_init(nullptr, &config, &playbackDevice) != MA_SUCCESS) {
             printf("[!] Failed to initialize playback device\n");
@@ -406,72 +539,54 @@ private:
     }
     
     void waitForPrebuffer() {
-        while (g_ring.available() < AudioConfig::PREBUFFER_SAMPLES) {
-            printf("[*] Waiting for prebuffer... %u samples buffered\r", g_ring.available());
+        // Add 5% safety margin to prevent initial underrun
+        const uint32_t targetFrames = AudioConfig::PREBUFFER_FRAMES;
+        const uint32_t safetyMargin = targetFrames / 20; // 5% margin
+        const uint32_t safeTargetFrames = targetFrames + safetyMargin;
+        
+        printf("[*] Waiting for prebuffer (target: %u frames + %u margin)...\n", 
+               targetFrames, safetyMargin);
+        
+        while (g_outputRing.available() / AudioConfig::CHANNELS < safeTargetFrames) {
+            const uint32_t currentFrames = g_outputRing.available() / AudioConfig::CHANNELS;
+            printf("    Progress: %u/%u frames (%.1f%%)     \r", 
+                   currentFrames, safeTargetFrames, (currentFrames * 100.0f) / safeTargetFrames);
+            fflush(stdout);
             ma_sleep(AudioConfig::SLEEP_INTERVAL_MS);
         }
-        printf("\n[+] Prebuffer complete\n");
+        
+        printf("\n[+] Prebuffer complete (filled: %u frames)                    \n",
+               g_outputRing.available() / AudioConfig::CHANNELS);
     }
 };
 
 // === Improved Audio Callbacks ===
 void AudioDeviceManager::capture_callback(ma_device* device, void* output, const void* input, ma_uint32 frameCount) {
-    (void)output; // Explicitly mark as unused
-    (void)device; // Explicitly mark as unused
+    (void)output;
+    (void)device;
 
-    // Early exit checks - before any processing
-    if (!g_running.load(std::memory_order_acquire) || 
-        !g_gpuReady.load(std::memory_order_acquire)) {
+    // Early exit checks
+    if (!g_running.load(std::memory_order_acquire)) {
         return;
     }
 
-    if (!input || !g_upsampler) [[unlikely]] {
+    if (!input) [[unlikely]] {
         return;
     }
 
     const auto* inputSamples = static_cast<const float*>(input);
+    const uint32_t samples = frameCount * AudioConfig::CHANNELS;
     
-    // Cast to VulkanUpsampler to access async API
-    auto* vulkanUpsampler = static_cast<VulkanUpsampler*>(g_upsampler.get());
+    // FAST PATH: Just push to input ring buffer (no GPU processing here)
+    g_inputRing.push(inputSamples, samples);
     
-    // OPTIMIZED: Check available slots before submission
-    // If no slots available, this indicates GPU processing bottleneck
-    const size_t availableSlots = vulkanUpsampler->getAvailableSlots();
-    
-    if (availableSlots == 0) [[unlikely]] {
-        // All slots busy - GPU is the bottleneck
-        // Track dropped frames for diagnostics
-        g_droppedFrames.fetch_add(frameCount, std::memory_order_relaxed);
-        
-        // Option 1: Drop frames (current behavior - prevents capture thread blocking)
-        return;
-        
-        // Option 2 (alternative): Could wait briefly for a slot, but risks blocking capture thread
-        // This is NOT recommended for real-time audio
-    }
-    
-    // Submit work asynchronously (non-blocking)
-    // Background polling thread will handle completed work
-    uint64_t sequenceId = vulkanUpsampler->processAsync(inputSamples, frameCount, 
-        [frameCount](const float* output, uint32_t outputFrames) {
-            // Callback executes when GPU work completes (called by polling thread)
-            const uint32_t outputSamples = outputFrames * AudioConfig::CHANNELS;
-            g_ring.push(output, outputSamples);
-            
-            // Track processing statistics
-            g_processedInputFrames.fetch_add(frameCount, std::memory_order_relaxed);
-            g_processedOutputSamples.fetch_add(outputSamples, std::memory_order_relaxed);
-        });
-    
-    // If submission failed despite available slots, there may be other issues
-    if (sequenceId == 0 && availableSlots > 0) [[unlikely]] {
-        g_droppedFrames.fetch_add(frameCount, std::memory_order_relaxed);
-    }
+    // Track captured frames
+    g_capturedInputFrames.fetch_add(frameCount, std::memory_order_relaxed);
 }
 
 void AudioDeviceManager::playback_callback(ma_device* device, void* output, const void* input, ma_uint32 frameCount) {
-    (void)input;  // Explicitly mark as unused
-    (void)device; // Explicitly mark as unused
+    (void)input;
+    (void)device;
 
     // Check if we're shutting down
     if (!g_running.load(std::memory_order_acquire)) {
@@ -484,7 +599,7 @@ void AudioDeviceManager::playback_callback(ma_device* device, void* output, cons
     auto* outputSamples = static_cast<float*>(output);
     const uint32_t requiredSamples = frameCount * AudioConfig::CHANNELS;
 
-    const uint32_t actualSamples = g_ring.pop(outputSamples, requiredSamples);
+    const uint32_t actualSamples = g_outputRing.pop(outputSamples, requiredSamples);
 
     if (actualSamples < requiredSamples) [[unlikely]] {
         // Zero-fill remaining samples
@@ -492,26 +607,29 @@ void AudioDeviceManager::playback_callback(ma_device* device, void* output, cons
         std::memset(outputSamples + actualSamples, 0, remainingBytes);
         
         // Only trigger underrun if buffer is critically low
-        const uint32_t remainingBuffer = g_ring.available();
-        if (remainingBuffer < AudioConfig::MIN_BUFFER_SAMPLES) {
+        const uint32_t remainingFrames = g_outputRing.available() / AudioConfig::CHANNELS;
+        if (remainingFrames < AudioConfig::MIN_BUFFER_FRAMES) {
             g_underrun.store(true, std::memory_order_relaxed);
         }
     }
+    
+    // Track played frames
+    g_playedOutputFrames.fetch_add(frameCount, std::memory_order_relaxed);
 }
 
 // === Main Processing Loop ===
 void runMainLoop(AudioDeviceManager& deviceManager) {
     auto lastStatusTime = std::chrono::steady_clock::now();
     auto startTime = std::chrono::steady_clock::now();
-    uint64_t lastDroppedFrames = 0;
-    uint64_t lastProcessedInputFrames = 0;
-    uint64_t lastProcessedOutputSamples = 0;
-    uint32_t lastBufferLevel = 0;
+    uint32_t lastInputBufferLevel = 0;
+    uint32_t lastOutputBufferLevel = 0;
     
     while (g_running) {
         // Non-blocking underrun check
         if (g_underrun.exchange(false)) {
-            printf("\n[!] Underrun detected. Re-buffering...\n");
+            // Clear current line first, then print underrun message
+            printf("\r%*s\r", 120, ""); // Clear line with spaces
+            printf("[!] Underrun detected. Re-buffering...\n");
 
             // Async restart - don't block main loop
             std::thread([&deviceManager]() {
@@ -528,81 +646,73 @@ void runMainLoop(AudioDeviceManager& deviceManager) {
         auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastStatusTime).count();
         
         if (elapsedMs >= 500) {
-            const uint32_t bufferLevel = g_ring.available();
+            const uint32_t inputBufferFrames = g_inputRing.available() / AudioConfig::CHANNELS;
+            const uint32_t outputBufferFrames = g_outputRing.available() / AudioConfig::CHANNELS;
+            
             const auto* vulkanUpsampler = static_cast<VulkanUpsampler*>(g_upsampler.get());
             const size_t availableSlots = vulkanUpsampler->getAvailableSlots();
+            const uint32_t batchSize = vulkanUpsampler->getRecommendedBatchSize();
+            const float currentRatio = vulkanUpsampler->getCurrentRatio();
             
-            // Calculate throughput metrics
-            const uint64_t currentProcessedInput = g_processedInputFrames.load(std::memory_order_relaxed);
-            const uint64_t currentProcessedOutput = g_processedOutputSamples.load(std::memory_order_relaxed);
-            const uint64_t inputFramesDelta = currentProcessedInput - lastProcessedInputFrames;
-            const uint64_t outputSamplesDelta = currentProcessedOutput - lastProcessedOutputSamples;
+            // Calculate buffer fill rates (frames per second)
+            const int32_t outputBufferDelta = static_cast<int32_t>(outputBufferFrames) - static_cast<int32_t>(lastOutputBufferLevel);
+            const double outputFillRate = (outputBufferDelta * 1000.0) / elapsedMs;
             
-            // Calculate buffer fill rate (samples per second)
-            const int32_t bufferDelta = static_cast<int32_t>(bufferLevel) - static_cast<int32_t>(lastBufferLevel);
-            const double bufferFillRate = (bufferDelta * 1000.0) / elapsedMs; // samples/sec
+            // Calculate buffer pressure
+            const float targetBufferFrames = static_cast<float>(AudioConfig::OUTPUT_RING_BUFFER_FRAMES) / 2;
+            const float bufferPressure = std::min(1.0f, outputBufferFrames / targetBufferFrames);
             
-            // Calculate processing rates
-            const double inputRate = (inputFramesDelta * 1000.0) / elapsedMs; // frames/sec
-            const double outputRate = (outputSamplesDelta * 1000.0) / elapsedMs; // samples/sec
-            
-            // Check for dropped frames
-            const uint64_t currentDropped = g_droppedFrames.load(std::memory_order_relaxed);
-            const uint64_t droppedSinceLastCheck = currentDropped - lastDroppedFrames;
+            // Calculate ratio deviation from base
+            const float baseRatio = static_cast<float>(AudioConfig::OUTPUT_SAMPLE_RATE) / 
+                                   static_cast<float>(AudioConfig::INPUT_SAMPLE_RATE);
+            const float ratioDeviation = ((currentRatio / baseRatio) - 1.0f) * 100.0f; // Percentage
             
             // Calculate total runtime
             auto totalElapsed = std::chrono::duration_cast<std::chrono::seconds>(now - startTime).count();
             
-            // Status display with comprehensive metrics
-            if (droppedSinceLastCheck > 0) {
-                printf("[*] Buf: %u (%.1f%%), Fill: %+.0f smp/s, In: %.0f fps, Out: %.0f sps, GPU: %u/%u, DROP: %llu      \r",
-                       bufferLevel,
-                       (bufferLevel * 100.0f) / AudioConfig::RING_BUFFER_SAMPLES,
-                       bufferFillRate,
-                       inputRate,
-                       outputRate,
-                       static_cast<uint32_t>(VulkanUpsampler::NUM_SLOTS - availableSlots),
-                       static_cast<uint32_t>(VulkanUpsampler::NUM_SLOTS),
-                       droppedSinceLastCheck * 2); // *2 for per-second rate
-            } else {
-                printf("[*] Buf: %u (%.1f%%), Fill: %+.0f smp/s, In: %.0f fps, Out: %.0f sps, GPU: %u/%u, Time: %llds    \r",
-                       bufferLevel,
-                       (bufferLevel * 100.0f) / AudioConfig::RING_BUFFER_SAMPLES,
-                       bufferFillRate,
-                       inputRate,
-                       outputRate,
-                       static_cast<uint32_t>(VulkanUpsampler::NUM_SLOTS - availableSlots),
-                       static_cast<uint32_t>(VulkanUpsampler::NUM_SLOTS),
-                       totalElapsed);
-            }
+            // SIMPLIFIED: Single-line compact status
+            printf("\r\033[K"); // Clear line
+            printf("Out:%u(%.0f%%%+.0f) GPU:%u/%u Batch:%u Ratio:%.6f(%+.3f%%) Press:%.0f%% %llus",
+                   outputBufferFrames,
+                   (outputBufferFrames * 100.0f) / AudioConfig::OUTPUT_RING_BUFFER_FRAMES,
+                   outputFillRate,
+                   static_cast<uint32_t>(VulkanUpsampler::NUM_SLOTS - availableSlots),
+                   static_cast<uint32_t>(VulkanUpsampler::NUM_SLOTS),
+                   batchSize,
+                   currentRatio,
+                   ratioDeviation,
+                   bufferPressure * 100.0f,
+                   static_cast<unsigned long long>(totalElapsed));
             fflush(stdout);
             
-            lastDroppedFrames = currentDropped;
-            lastProcessedInputFrames = currentProcessedInput;
-            lastProcessedOutputSamples = currentProcessedOutput;
-            lastBufferLevel = bufferLevel;
+            lastInputBufferLevel = inputBufferFrames;
+            lastOutputBufferLevel = outputBufferFrames;
             lastStatusTime = now;
         }
 
         // Very short sleep - let other threads run
         std::this_thread::sleep_for(std::chrono::milliseconds(AudioConfig::MAIN_LOOP_SLEEP_MS));
     }
-    printf("\n"); // Clear the status line
+    printf("\n");
     
     // Print final statistics
     auto totalElapsed = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - startTime).count();
-    const uint64_t totalDropped = g_droppedFrames.load(std::memory_order_relaxed);
+    const uint64_t totalCaptured = g_capturedInputFrames.load(std::memory_order_relaxed);
     const uint64_t totalProcessed = g_processedInputFrames.load(std::memory_order_relaxed);
+    const uint64_t totalPlayed = g_playedOutputFrames.load(std::memory_order_relaxed);
     
     if (totalElapsed > 0) {
         printf("[+] Session statistics:\n");
         printf("    Runtime: %lld seconds\n", totalElapsed);
-        printf("    Processed: %llu input frames (%.1f fps avg)\n", 
+        printf("    Captured: %llu frames (%.1f fps avg)\n", 
+               totalCaptured, totalCaptured / static_cast<double>(totalElapsed));
+        printf("    Processed: %llu frames (%.1f fps avg)\n",
                totalProcessed, totalProcessed / static_cast<double>(totalElapsed));
-        printf("    Dropped: %llu frames (%.3f%% loss rate)\n",
-               totalDropped, 
-               totalProcessed > 0 ? (totalDropped * 100.0 / totalProcessed) : 0.0);
+        printf("    Played: %llu frames (%.1f fps avg)\n",
+               totalPlayed, totalPlayed / static_cast<double>(totalElapsed));
+        printf("    Loss rate: %.3f%%\n",
+               totalCaptured > 0 ? ((totalCaptured - totalProcessed) * 100.0 / totalCaptured) : 0.0);
     }
 }
 
@@ -624,36 +734,38 @@ int main() {
     // Step 2: Load shader
     g_upsampler->setKernel(ResampleKernel::Linear);
     
-    // Step 3: Initialize ring buffer
-    g_ring.init(AudioConfig::RING_BUFFER_SAMPLES);
+    // Step 3: Initialize dual ring buffers
+    printf("[*] Initializing dual ring buffers...\n");
+    g_inputRing.init(AudioConfig::INPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS);
+    g_outputRing.init(AudioConfig::OUTPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS);
 
-    // Step 4: Mark GPU as ready BEFORE initializing audio devices
-    // This MUST be done before ma_device_init() calls
+    // Step 4: Mark GPU as ready
     g_gpuReady.store(true, std::memory_order_release);
     
-    // Step 5: Start GPU polling thread
-    printf("[*] Starting GPU polling thread...\n");
-    g_poller.start();
+    // Step 5: Start GPU processing thread
+    printf("[*] Starting GPU processing thread...\n");
+    g_gpuProcessor.start();
     
     printf("[*] Initializing audio devices...\n");
     
-    // Step 6: Initialize audio devices (callbacks may be called during init)
+    // Step 6: Initialize audio devices
     AudioDeviceManager deviceManager;
     if (!deviceManager.initializeCapture() || !deviceManager.initializePlayback()) {
         g_gpuReady.store(false, std::memory_order_release);
-        g_poller.stop();
+        g_gpuProcessor.stop();
         return EXIT_FAILURE;
     }
 
     // Step 7: Start devices
     if (!deviceManager.startDevices()) {
         g_gpuReady.store(false, std::memory_order_release);
-        g_poller.stop();
+        g_gpuProcessor.stop();
         return EXIT_FAILURE;
     }
 
     printf("[+] Real-time GPU upsampler started (%u -> %uHz)\n", 
            AudioConfig::INPUT_SAMPLE_RATE, AudioConfig::OUTPUT_SAMPLE_RATE);
+    printf("[*] Architecture: Capture -> Input Buffer (44.1kHz) -> GPU -> Output Buffer (384kHz) -> Playback\n");
     printf("[*] Press Ctrl+C to stop...\n");
 
     // Run main processing loop
@@ -662,14 +774,14 @@ int main() {
     // Graceful shutdown sequence
     printf("[*] Initiating shutdown sequence...\n");
     
-    // Mark GPU as not ready to stop callbacks
+    // Mark GPU as not ready
     g_gpuReady.store(false, std::memory_order_release);
     
-    // Step 1: Stop GPU polling thread
-    printf("[*] Stopping GPU polling thread...\n");
-    g_poller.stop();
+    // Step 1: Stop GPU processing thread
+    printf("[*] Stopping GPU processing thread...\n");
+    g_gpuProcessor.stop();
     
-    // Step 2: Stop audio devices to prevent callbacks from running
+    // Step 2: Stop audio devices
     deviceManager.stopDevices();
     
     // Step 3: Cleanup GPU resources

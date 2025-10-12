@@ -24,6 +24,17 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
     inRate = inputRate;
     outRate = outputRate;
     numChannels = channels;
+    
+    // Initialize adaptive ratio state
+    adaptiveState.baseRatio = static_cast<float>(outputRate) / static_cast<float>(inputRate);
+    
+    // CRITICAL: Start with higher ratio (base * 1.02) to prevent initial underrun
+    // This generates 2% more frames during startup to fill output buffer faster
+    // Adaptive PID will gradually reduce it back to baseRatio once buffer is stable
+    adaptiveState.currentRatio = adaptiveState.baseRatio * 1.02f;
+    
+    printf("[*] Initial ratio set to %.6f (base: %.6f, +2%% startup boost)\n",
+           adaptiveState.currentRatio, adaptiveState.baseRatio);
 
     if (!initVulkan()) {
         printf("[!] Vulkan initialization failed\n");
@@ -71,6 +82,7 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
     printf("[+] Initial buffer capacity: input=%u KB, output=%u KB per slot\n",
            static_cast<uint32_t>(inputSize / 1024), 
            static_cast<uint32_t>(outputSize / 1024));
+    printf("[+] Base ratio: %.6f (adaptive ratio enabled)\n", adaptiveState.baseRatio);
     
     return true;
 }
@@ -407,21 +419,36 @@ bool VulkanUpsampler::createBuffer(VkDeviceSize size, VkBuffer& buffer, VkDevice
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     allocInfo.allocationSize = memRequirements.size;
     
-    // Try to find cached memory first for better performance
+    // Try memory types in priority order:
+    // 1. DEVICE_LOCAL + HOST_VISIBLE (ReBAR) - Best performance
+    // 2. HOST_VISIBLE + HOST_CACHED - Good performance
+    // 3. HOST_VISIBLE + HOST_COHERENT - Fallback
+    
     uint32_t memoryTypeIndex;
+    bool foundReBar = false;
+    
     try {
-        memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, BUFFER_MEMORY_PROPS);
+        memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, BUFFER_MEMORY_PROPS_REBAR);
+        foundReBar = true;
+        if (strcmp(label, "slot.input") == 0) {
+            printf("[+] Using ReBAR memory (DEVICE_LOCAL + HOST_VISIBLE) for %s\n", label);
+        }
     } catch (const std::runtime_error&) {
-        // Fallback to non-cached if cached not available
+        // ReBAR not available, try cached memory
         try {
-            memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, BUFFER_MEMORY_PROPS_FALLBACK);
-            if (strcmp(label, "slot.input") == 0) {
-                printf("[*] Using non-cached memory for %s (cached not available)\n", label);
+            memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, BUFFER_MEMORY_PROPS);
+        } catch (const std::runtime_error&) {
+            // Fallback to non-cached
+            try {
+                memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, BUFFER_MEMORY_PROPS_FALLBACK);
+                if (strcmp(label, "slot.input") == 0) {
+                    printf("[*] Using fallback memory for %s (ReBAR/cached not available)\n", label);
+                }
+            } catch (const std::runtime_error& e) {
+                printf("[!] %s for %s buffer\n", e.what(), label);
+                vkDestroyBuffer(device, buffer, nullptr);
+                return false;
             }
-        } catch (const std::runtime_error& e) {
-            printf("[!] %s for %s buffer\n", e.what(), label);
-            vkDestroyBuffer(device, buffer, nullptr);
-            return false;
         }
     }
     
@@ -665,11 +692,14 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples, uint32_t
     vkCmdBindPipeline(slot.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
     vkCmdBindDescriptorSets(slot.commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &slot.descriptorSet, 0, nullptr);
 
-    // Set push constants
+    // Set push constants with adaptive ratio
     PushConstants push{};
     push.inFrameCount = inSamples / numChannels;
     push.outFrameCount = outSamples / numChannels;
-    push.ratio = static_cast<float>(static_cast<double>(outRate) / inRate);
+    
+    // Use adaptive ratio if enabled, otherwise use base ratio
+    push.ratio = getCurrentRatio();
+    
     vkCmdPushConstants(slot.commandBuffer, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &push);
 
     // OPTIMIZED: Only input barrier, and only if using non-coherent memory
@@ -748,8 +778,8 @@ bool VulkanUpsampler::enqueue(const float* input, uint32_t inputFrames) {
         return false;
     }
 
-    // Use fixed ratio for consistent audio quality
-    const float ratio = static_cast<float>(outRate) / inRate;
+    // Use adaptive ratio if enabled
+    const float ratio = getCurrentRatio();
     const uint32_t inSamples = inputFrames * numChannels;
 
     // Combine tail from previous frame with current input
@@ -1256,4 +1286,137 @@ void VulkanUpsampler::cleanupSlotBuffers(GpuSlot& slotRef) {
         vkFreeMemory(device, slotRef.outputMemory, nullptr);
         slotRef.outputMemory = VK_NULL_HANDLE;
     }
+}
+
+// === Adaptive Frame Generation Implementation ===
+
+void VulkanUpsampler::updateAdaptiveParams(uint32_t outputBufferLevel, uint32_t targetBufferLevel) {
+    adaptiveState.targetBufferLevel = targetBufferLevel;
+    
+    // Calculate buffer pressure (0.0 = empty, 1.0 = at or above target)
+    if (targetBufferLevel > 0) {
+        adaptiveState.bufferPressure = std::min(1.0f, static_cast<float>(outputBufferLevel) / targetBufferLevel);
+    } else {
+        adaptiveState.bufferPressure = 1.0f;
+    }
+    
+    // Update batch size based on pressure
+    updateAdaptiveBatchSize();
+    
+    // NEW: Update adaptive ratio based on buffer level
+    updateAdaptiveRatio(outputBufferLevel, targetBufferLevel);
+    
+    // Enable adaptive mode
+    adaptiveEnabled.store(true, std::memory_order_release);
+}
+
+uint32_t VulkanUpsampler::getRecommendedBatchSize() const {
+    if (!adaptiveEnabled.load(std::memory_order_acquire)) {
+        return 512; // Default batch size
+    }
+    
+    return adaptiveState.currentBatchSize;
+}
+
+void VulkanUpsampler::updateAdaptiveBatchSize() {
+    // Adaptive batch sizing strategy:
+    // - Low pressure (< 0.3): Use maximum batch size for aggressive catchup
+    // - Medium pressure (0.3 - 0.7): Scale batch size based on pressure
+    // - High pressure (> 0.7): Use minimum batch size to reduce latency
+    
+    const float pressure = adaptiveState.bufferPressure;
+    
+    uint32_t newBatchSize;
+    
+    if (pressure < 0.4f) {
+        // CRITICAL: Buffer running low - use maximum batch size
+        newBatchSize = adaptiveState.maxBatchSize;
+    } else if (pressure < 0.8f) {
+        // MEDIUM: Scale batch size inversely with pressure
+        // As pressure increases (buffer fills), reduce batch size
+        const float scaledPressure = (pressure - 0.4f) / 0.4f; // Normalize to [0, 1]
+        const uint32_t range = adaptiveState.maxBatchSize - adaptiveState.minBatchSize;
+        newBatchSize = adaptiveState.maxBatchSize - static_cast<uint32_t>(scaledPressure * range);
+    } else {
+        // HIGH: Buffer is healthy - use minimum batch size for low latency
+        newBatchSize = adaptiveState.minBatchSize;
+    }
+    
+    // Apply hysteresis to prevent oscillation (only update if change is significant)
+    const uint32_t currentSize = adaptiveState.currentBatchSize;
+    const uint32_t threshold = adaptiveState.minBatchSize / 8; // 12.5% threshold
+    
+    if (std::abs(static_cast<int32_t>(newBatchSize) - static_cast<int32_t>(currentSize)) > static_cast<int32_t>(threshold)) {
+        adaptiveState.currentBatchSize = newBatchSize;
+    }
+}
+
+// === NEW: Adaptive Ratio Adjustment Implementation ===
+
+void VulkanUpsampler::updateAdaptiveRatio(uint32_t outputBufferLevel, uint32_t targetBufferLevel) {
+    if (targetBufferLevel == 0) {
+        return; // Cannot adjust without target
+    }
+    
+    // Calculate normalized buffer level error (-1.0 to +1.0)
+    // Negative = buffer too low (need to generate more frames)
+    // Positive = buffer too high (need to generate fewer frames)
+    const float currentLevel = static_cast<float>(outputBufferLevel);
+    const float targetLevel = static_cast<float>(targetBufferLevel);
+    adaptiveState.ratioError = (currentLevel - targetLevel) / targetLevel;
+    
+    // Calculate error derivative (rate of change)
+    adaptiveState.ratioErrorDerivative = adaptiveState.ratioError - adaptiveState.lastRatioError;
+    adaptiveState.lastRatioError = adaptiveState.ratioError;
+    
+    // Calculate error integral (accumulated error) with anti-windup
+    adaptiveState.ratioErrorIntegral += adaptiveState.ratioError;
+    
+    // Anti-windup: Clamp integral term to prevent excessive accumulation
+    const float maxIntegral = 0.5f;  // Reduced from 1.0f to prevent overshoot
+    adaptiveState.ratioErrorIntegral = std::clamp(adaptiveState.ratioErrorIntegral, -maxIntegral, maxIntegral);
+    
+    // CONSERVATIVE PID gains - less aggressive to prevent buffer overflow
+    const float Kp = 0.003f;  // Proportional: reduced from 0.008f
+    const float Ki = 0.0008f; // Integral: reduced from 0.002f
+    const float Kd = 0.0012f; // Derivative: reduced from 0.003f
+    
+    // Calculate PID output (desired ratio adjustment)
+    const float pidOutput = 
+        (Kp * adaptiveState.ratioError) +           // Proportional term
+        (Ki * adaptiveState.ratioErrorIntegral) +   // Integral term
+        (Kd * adaptiveState.ratioErrorDerivative);  // Derivative term
+    
+    // Apply adjustment to base ratio
+    // Negative error (buffer low) → PID negative → subtract negative = increase ratio
+    // Positive error (buffer high) → PID positive → subtract positive = decrease ratio
+    const float targetRatio = adaptiveState.baseRatio - pidOutput;
+    
+    // CRITICAL: Allow BIDIRECTIONAL adjustment around baseRatio
+    // Buffer low: ratio can go UP to baseRatio * (1 + range)
+    // Buffer high: ratio can go DOWN to baseRatio * (1 - range)
+    // Target state: converge to baseRatio when buffer is at target level
+    const float minRatio = adaptiveState.baseRatio * (1.0f - adaptiveState.ratioAdjustmentRange);  // Can go below base
+    const float maxRatio = adaptiveState.baseRatio * (1.0f + adaptiveState.ratioAdjustmentRange);  // Can go above base
+    const float clampedRatio = std::clamp(targetRatio, minRatio, maxRatio);
+    
+    // Apply exponential smoothing to prevent sudden changes (avoid audio artifacts)
+    // Slower smoothing for more stable convergence
+    const float alpha = 0.15f; // Reduced from 0.3f - 15% new value, 85% old value - slower, more stable convergence
+    adaptiveState.currentRatio = (alpha * clampedRatio) + ((1.0f - alpha) * adaptiveState.currentRatio);
+}
+
+float VulkanUpsampler::getCurrentRatio() const {
+    if (adaptiveEnabled.load(std::memory_order_acquire)) {
+        return adaptiveState.currentRatio;
+    }
+    return adaptiveState.baseRatio;
+}
+
+void VulkanUpsampler::setRatioAdjustmentRange(float range) {
+    // Clamp to safe range (max ±2.0% to prevent excessive drift)
+    adaptiveState.ratioAdjustmentRange = std::clamp(range, 0.0f, 0.02f);
+    
+    printf("[*] Adaptive ratio range set to ±%.2f%%\n", 
+           adaptiveState.ratioAdjustmentRange * 100.0f);
 }

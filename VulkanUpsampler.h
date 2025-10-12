@@ -6,6 +6,7 @@
 #include <array>
 #include <queue>
 #include <functional>
+#include <atomic>
 
 struct GpuSlot {
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
@@ -74,6 +75,23 @@ public:
     
     /// @brief Get number of available slots
     size_t getAvailableSlots() const;
+    
+    /// @brief Set adaptive processing parameters based on buffer state
+    /// @param outputBufferLevel Current output buffer level in frames
+    /// @param targetBufferLevel Target buffer level in frames
+    void updateAdaptiveParams(uint32_t outputBufferLevel, uint32_t targetBufferLevel);
+    
+    /// @brief Get recommended batch size based on current adaptive state
+    /// @return Recommended batch size in frames
+    uint32_t getRecommendedBatchSize() const;
+    
+    /// @brief Get current adaptive ratio
+    /// @return Current ratio being used for resampling
+    float getCurrentRatio() const;
+    
+    /// @brief Set ratio adjustment range
+    /// @param range Maximum adjustment range (e.g., 0.005 = ±0.5%)
+    void setRatioAdjustmentRange(float range);
     
     // === Low-level API (for manual control) ===
     bool enqueue(const float* input, uint32_t inputFrames);
@@ -157,14 +175,26 @@ private:
     // === Constants ===
     static constexpr uint32_t DEFAULT_CHANNELS = 2;
     
-    // OPTIMIZED: Use HOST_VISIBLE + HOST_CACHED for better CPU read performance
-    // HOST_CACHED dramatically improves CPU->GPU and GPU->CPU transfer speeds
+    // OPTIMIZED: ReBAR-aware memory properties for maximum performance
+    // Priority order (tries each in sequence):
+    // 1. DEVICE_LOCAL + HOST_VISIBLE (ReBAR): GPU VRAM with CPU direct access
+    // 2. HOST_VISIBLE + HOST_CACHED: Shared memory with CPU cache
+    // 3. HOST_VISIBLE + HOST_COHERENT: Fallback shared memory
+    
+    // Best: ReBAR-enabled (DEVICE_LOCAL + HOST_VISIBLE)
+    // GPU reads from fast VRAM, CPU writes directly via ReBAR
+    static constexpr VkMemoryPropertyFlags BUFFER_MEMORY_PROPS_REBAR = 
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |   // GPU VRAM (fastest for GPU)
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |   // CPU can write (ReBAR)
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;   // Auto sync
+    
+    // Good: Cached shared memory (without ReBAR)
     static constexpr VkMemoryPropertyFlags BUFFER_MEMORY_PROPS = 
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | 
         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
         VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     
-    // Fallback without CACHED flag if not available
+    // Fallback: Non-cached shared memory
     static constexpr VkMemoryPropertyFlags BUFFER_MEMORY_PROPS_FALLBACK = 
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
@@ -219,4 +249,38 @@ private:
         uint64_t sequenceId;
     };
     std::queue<PendingWork> pendingQueue;
+
+    // === Adaptive Processing State ===
+    struct AdaptiveState {
+        uint32_t currentBatchSize = 1536;       // Current batch size in frames (increased from 512)
+        uint32_t minBatchSize = 512;            // Minimum batch size (increased from 256)
+        uint32_t maxBatchSize = 4096;           // Maximum batch size (increased from 2048)
+        uint32_t targetBufferLevel = 0;         // Target buffer level in frames
+        float bufferPressure = 0.0f;            // Buffer pressure (0.0 = critical, 1.0 = full)
+        uint64_t lastUpdateTime = 0;            // Last update timestamp (ms)
+        
+        // === Adaptive Ratio Adjustment ===
+        float baseRatio = 1.0f;                 // Base ratio (outputRate / inputRate) - target equilibrium
+        float currentRatio = 1.0f;              // Current adjusted ratio
+        float ratioAdjustmentRange = 0.020f;    // Max ±2.0% bidirectional adjustment range
+        float ratioSmoothingFactor = 0.3f;      // Smoothing factor for ratio changes
+        
+        // PID controller state for ratio adjustment
+        // Corrects buffer drift by adjusting frame generation rate
+        float ratioError = 0.0f;                // Current buffer level error
+        float ratioErrorIntegral = 0.0f;        // Accumulated error (I term)
+        float ratioErrorDerivative = 0.0f;      // Rate of error change (D term)
+        float lastRatioError = 0.0f;            // Previous error for derivative calculation
+    };
+    
+    AdaptiveState adaptiveState;
+    std::atomic<bool> adaptiveEnabled{false};
+    
+    /// @brief Update adaptive batch size based on buffer pressure
+    void updateAdaptiveBatchSize();
+    
+    /// @brief Update adaptive ratio based on buffer level (NEW)
+    /// @param outputBufferLevel Current output buffer level in frames
+    /// @param targetBufferLevel Target buffer level in frames
+    void updateAdaptiveRatio(uint32_t outputBufferLevel, uint32_t targetBufferLevel);
 };

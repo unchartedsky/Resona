@@ -214,7 +214,10 @@ public:
                 // === ADAPTIVE BATCH SIZING ===
                 // Update adaptive parameters based on current buffer state
                 const uint32_t outputBufferFrames = g_outputRing.available() / AudioConfig::CHANNELS;
-                const uint32_t targetBufferFrames = AudioConfig::OUTPUT_RING_BUFFER_FRAMES / 2; // Target 50% full
+                
+                // REDUCED TARGET: 30% instead of 50% to prevent overgeneration
+                // Lower target = less aggressive frame generation = less audio distortion
+                const uint32_t targetBufferFrames = AudioConfig::OUTPUT_RING_BUFFER_FRAMES * 30 / 100; // Target 30% full
                 
                 vulkanUpsampler->updateAdaptiveParams(outputBufferFrames, targetBufferFrames);
                 
@@ -658,8 +661,8 @@ void runMainLoop(AudioDeviceManager& deviceManager) {
             const int32_t outputBufferDelta = static_cast<int32_t>(outputBufferFrames) - static_cast<int32_t>(lastOutputBufferLevel);
             const double outputFillRate = (outputBufferDelta * 1000.0) / elapsedMs;
             
-            // Calculate buffer pressure
-            const float targetBufferFrames = static_cast<float>(AudioConfig::OUTPUT_RING_BUFFER_FRAMES) / 2;
+            // Calculate buffer pressure (relative to 30% target, not 50%)
+            const float targetBufferFrames = static_cast<float>(AudioConfig::OUTPUT_RING_BUFFER_FRAMES) * 30.0f / 100.0f;
             const float bufferPressure = std::min(1.0f, outputBufferFrames / targetBufferFrames);
             
             // Calculate ratio deviation from base

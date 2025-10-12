@@ -28,12 +28,12 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
     // Initialize adaptive ratio state
     adaptiveState.baseRatio = static_cast<float>(outputRate) / static_cast<float>(inputRate);
     
-    // CRITICAL: Start with higher ratio (base * 1.02) to prevent initial underrun
-    // This generates 2% more frames during startup to fill output buffer faster
-    // Adaptive PID will gradually reduce it back to baseRatio once buffer is stable
-    adaptiveState.currentRatio = adaptiveState.baseRatio * 1.02f;
+    // CRITICAL FIX: Start at base ratio instead of boosted ratio
+    // Previous startup boost caused buffer overrun - PID controller can handle buffer filling naturally
+    // No artificial boost needed - let adaptive algorithm adjust ratio based on actual buffer state
+    adaptiveState.currentRatio = adaptiveState.baseRatio;
     
-    printf("[*] Initial ratio set to %.6f (base: %.6f, +2%% startup boost)\n",
+    printf("[*] Initial ratio set to %.6f (base ratio, adaptive PID will adjust as needed)\n",
            adaptiveState.currentRatio, adaptiveState.baseRatio);
 
     if (!initVulkan()) {
@@ -1359,8 +1359,8 @@ void VulkanUpsampler::updateAdaptiveRatio(uint32_t outputBufferLevel, uint32_t t
     }
     
     // Calculate normalized buffer level error (-1.0 to +1.0)
-    // Negative = buffer too low (need to generate more frames)
-    // Positive = buffer too high (need to generate fewer frames)
+    // Positive error = buffer too high (need to generate FEWER frames) -> DECREASE ratio
+    // Negative error = buffer too low (need to generate MORE frames) -> INCREASE ratio
     const float currentLevel = static_cast<float>(outputBufferLevel);
     const float targetLevel = static_cast<float>(targetBufferLevel);
     adaptiveState.ratioError = (currentLevel - targetLevel) / targetLevel;
@@ -1373,13 +1373,14 @@ void VulkanUpsampler::updateAdaptiveRatio(uint32_t outputBufferLevel, uint32_t t
     adaptiveState.ratioErrorIntegral += adaptiveState.ratioError;
     
     // Anti-windup: Clamp integral term to prevent excessive accumulation
-    const float maxIntegral = 0.5f;  // Reduced from 1.0f to prevent overshoot
+    const float maxIntegral = 1.0f;
     adaptiveState.ratioErrorIntegral = std::clamp(adaptiveState.ratioErrorIntegral, -maxIntegral, maxIntegral);
     
-    // CONSERVATIVE PID gains - less aggressive to prevent buffer overflow
-    const float Kp = 0.003f;  // Proportional: reduced from 0.008f
-    const float Ki = 0.0008f; // Integral: reduced from 0.002f
-    const float Kd = 0.0012f; // Derivative: reduced from 0.003f
+    // BALANCED PID gains - responsive but smooth to prevent audio artifacts
+    // Reduced from very aggressive 4x values to 2x for better stability
+    const float Kp = 0.016f;  // Proportional: 2x from 0.008f - moderate immediate response
+    const float Ki = 0.0016f; // Integral: 2x from 0.0008f - gradual steady-state correction
+    const float Kd = 0.0024f; // Derivative: 2x from 0.0012f - moderate damping
     
     // Calculate PID output (desired ratio adjustment)
     const float pidOutput = 
@@ -1387,22 +1388,22 @@ void VulkanUpsampler::updateAdaptiveRatio(uint32_t outputBufferLevel, uint32_t t
         (Ki * adaptiveState.ratioErrorIntegral) +   // Integral term
         (Kd * adaptiveState.ratioErrorDerivative);  // Derivative term
     
-    // Apply adjustment to base ratio
-    // Negative error (buffer low) → PID negative → subtract negative = increase ratio
-    // Positive error (buffer high) → PID positive → subtract positive = decrease ratio
+    // Apply adjustment to base ratio with CORRECT sign
+    // Positive error (buffer high) → positive PID → SUBTRACT to decrease ratio ✓
+    // Negative error (buffer low) → negative PID → SUBTRACT negative = ADD to increase ratio ✓
     const float targetRatio = adaptiveState.baseRatio - pidOutput;
     
     // CRITICAL: Allow BIDIRECTIONAL adjustment around baseRatio
     // Buffer low: ratio can go UP to baseRatio * (1 + range)
     // Buffer high: ratio can go DOWN to baseRatio * (1 - range)
-    // Target state: converge to baseRatio when buffer is at target level
-    const float minRatio = adaptiveState.baseRatio * (1.0f - adaptiveState.ratioAdjustmentRange);  // Can go below base
-    const float maxRatio = adaptiveState.baseRatio * (1.0f + adaptiveState.ratioAdjustmentRange);  // Can go above base
+    const float minRatio = adaptiveState.baseRatio * (1.0f - adaptiveState.ratioAdjustmentRange);
+    const float maxRatio = adaptiveState.baseRatio * (1.0f + adaptiveState.ratioAdjustmentRange);
     const float clampedRatio = std::clamp(targetRatio, minRatio, maxRatio);
     
     // Apply exponential smoothing to prevent sudden changes (avoid audio artifacts)
-    // Slower smoothing for more stable convergence
-    const float alpha = 0.15f; // Reduced from 0.3f - 15% new value, 85% old value - slower, more stable convergence
+    // MODERATE alpha for balance between responsiveness and stability
+    // Reduced from 0.65 to 0.25 for much smoother transitions
+    const float alpha = 0.25f; // 25% new value, 75% old value - smooth and gradual
     adaptiveState.currentRatio = (alpha * clampedRatio) + ((1.0f - alpha) * adaptiveState.currentRatio);
 }
 

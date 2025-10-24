@@ -1,7 +1,7 @@
 ﻿#version 450
 layout(local_size_x = 64) in;
 
-// input: stereo interleaved (R0, L0, R1, L1, ...)
+// input: stereo interleaved (L0, R0, L1, R1, ...)
 layout(binding = 0) readonly buffer InputBuffer {
     float inSamples[];
 };
@@ -23,7 +23,7 @@ void main() {
     if (gid >= pc.outFrameCount * 2) return;
 
     // Channel and frame index calculation (bit ops are fast)
-    uint channel = 1 - (gid & 1); // 0 = R, 1 = L
+    uint channel = gid & 1; // 0 = L, 1 = R
     uint outFrameIndex = gid >> 1;
 
     // Use hardware-accelerated floor/fract

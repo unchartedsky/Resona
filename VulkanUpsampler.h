@@ -252,25 +252,18 @@ private:
 
     // === Adaptive Processing State ===
     struct AdaptiveState {
-        uint32_t currentBatchSize = 1536;       // Current batch size in frames (increased from 512)
-        uint32_t minBatchSize = 512;            // Minimum batch size (increased from 256)
-        uint32_t maxBatchSize = 4096;           // Maximum batch size (increased from 2048)
+        uint32_t currentBatchSize = 1536;       // Current batch size in frames
+        uint32_t minBatchSize = 512;            // Minimum batch size
+        uint32_t maxBatchSize = 4096;           // Maximum batch size
         uint32_t targetBufferLevel = 0;         // Target buffer level in frames
         float bufferPressure = 0.0f;            // Buffer pressure (0.0 = critical, 1.0 = full)
-        uint64_t lastUpdateTime = 0;            // Last update timestamp (ms)
         
-        // === Adaptive Ratio Adjustment ===
-        float baseRatio = 1.0f;                 // Base ratio (outputRate / inputRate) - target equilibrium
-        float currentRatio = 1.0f;              // Current adjusted ratio
-        float ratioAdjustmentRange = 0.020f;    // Max ±2.0% bidirectional adjustment range
-        float ratioSmoothingFactor = 0.3f;      // Smoothing factor for ratio changes
+        // === Fixed Ratio (no adaptive adjustment) ===
+        float baseRatio = 1.0f;                 // Base ratio (outputRate / inputRate) - ALWAYS used
         
-        // PID controller state for ratio adjustment
-        // Corrects buffer drift by adjusting frame generation rate
-        float ratioError = 0.0f;                // Current buffer level error
-        float ratioErrorIntegral = 0.0f;        // Accumulated error (I term)
-        float ratioErrorDerivative = 0.0f;      // Rate of error change (D term)
-        float lastRatioError = 0.0f;            // Previous error for derivative calculation
+        // === Startup Buffer Level Capture ===
+        uint32_t initialBufferLevel = 0;        // Buffer level captured at startup
+        bool initialLevelCaptured = false;      // Flag to capture initial level only once
     };
     
     AdaptiveState adaptiveState;
@@ -278,9 +271,4 @@ private:
     
     /// @brief Update adaptive batch size based on buffer pressure
     void updateAdaptiveBatchSize();
-    
-    /// @brief Update adaptive ratio based on buffer level (NEW)
-    /// @param outputBufferLevel Current output buffer level in frames
-    /// @param targetBufferLevel Target buffer level in frames
-    void updateAdaptiveRatio(uint32_t outputBufferLevel, uint32_t targetBufferLevel);
 };

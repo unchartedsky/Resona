@@ -22,31 +22,33 @@ void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= pc.outFrameCount * 2) return;
 
-    // Channel and frame index calculation (bit ops are fast)
-    uint channel = gid & 1; // 0 = L, 1 = R
+    uint channel = gid & 1;
     uint outFrameIndex = gid >> 1;
 
-    // Use hardware-accelerated floor/fract
-    float inFrameIndex = float(outFrameIndex) / pc.ratio;
-    uint baseFrame = uint(floor(inFrameIndex));
-    float frac = fract(inFrameIndex);
-
-    // Safe boundary clamping
-    uint maxFrameIndex = pc.inFrameCount - 1;
-    uint frame0 = min(baseFrame, maxFrameIndex);
-    uint frame1 = min(baseFrame + 1, maxFrameIndex);
+    // Integer position calculation (avoids float precision issues)
+    uint inFrame = (outFrameIndex * pc.inFrameCount) / pc.outFrameCount;
     
-    // Calculate sample indices
-    uint idx0 = frame0 * 2 + channel;
-    uint idx1 = frame1 * 2 + channel;
-
+    // CRITICAL: Clamp inFrame so that inFrame + 1 is ALWAYS valid
+    uint maxValidFrame = pc.inFrameCount - 2;
+    if (inFrame > maxValidFrame) {
+        inFrame = maxValidFrame;
+    }
+    
+    // Both frame0 and frame1 are guaranteed valid
+    uint frame0 = inFrame;
+    uint frame1 = inFrame + 1;
+    
+    // Calculate fractional part using integer math
+    uint numerator = outFrameIndex * pc.inFrameCount;
+    uint remainder = numerator - (inFrame * pc.outFrameCount);
+    float frac = float(remainder) / float(pc.outFrameCount);
+    
     // Fetch samples
-    float s0 = inSamples[idx0];
-    float s1 = inSamples[idx1];
-
-    // Hardware-accelerated linear interpolation (single MAD instruction)
-    float result = mix(s0, s1, frac);
+    float s0 = inSamples[frame0 * 2 + channel];
+    float s1 = inSamples[frame1 * 2 + channel];
     
-    // Hardware-accelerated clamp (fused MIN/MAX)
-    outSamples[gid] = clamp(result, -1.0, 1.0);
+    // Linear interpolation
+    float result = s0 + frac * (s1 - s0);
+    
+    outSamples[gid] = result;
 }

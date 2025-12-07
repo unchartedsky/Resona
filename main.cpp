@@ -734,8 +734,8 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    // Step 2: Load shader
-    g_upsampler->setKernel(ResampleKernel::Linear);
+    // Step 2: Load shader - use Nearest for noise-free resampling
+    g_upsampler->setKernel(ResampleKernel::Nearest);
     
     // Step 3: Initialize dual ring buffers
     printf("[*] Initializing dual ring buffers...\n");

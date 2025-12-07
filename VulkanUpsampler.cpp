@@ -102,6 +102,9 @@ void VulkanUpsampler::setKernel(ResampleKernel kernel) {
     // Load new shader
     std::string filename;
     switch (kernel) {
+    case ResampleKernel::Nearest:
+        filename = "nearest.spv";
+        break;
     case ResampleKernel::Linear:
         filename = "linear.spv";
         break;

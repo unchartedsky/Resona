@@ -3,9 +3,10 @@
 
 /// @brief Available resampling kernel types.
 enum class ResampleKernel {
-    Linear,
-    Cubic,
-    Sinc
+    Nearest,  // Nearest neighbor (no interpolation, noise-free)
+    Linear,   // Linear interpolation (smooth but may have artifacts)
+    Cubic,    // Cubic interpolation (not yet implemented)
+    Sinc      // Sinc interpolation (not yet implemented)
 };
 
 /// @brief Abstract interface for GPU-based audio resamplers.

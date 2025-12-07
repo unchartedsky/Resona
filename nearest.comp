@@ -1,0 +1,39 @@
+#version 450
+layout(local_size_x = 64) in;
+
+// Input: stereo interleaved audio (L0, R0, L1, R1, ...)
+layout(binding = 0) readonly buffer InputBuffer {
+    float inSamples[];
+};
+
+// Output: stereo interleaved audio (same format)
+layout(binding = 1) writeonly buffer OutputBuffer {
+    float outSamples[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint inFrameCount;   // Number of input frames
+    uint outFrameCount;  // Number of output frames
+    float ratio;         // Resample ratio (output / input) - unused, kept for compatibility
+} pc;
+
+// Nearest neighbor resampling
+// Simple and noise-free upsampling by selecting the closest input sample
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.outFrameCount * 2u) return;
+
+    uint channel = gid & 1u;           // 0 = Left, 1 = Right
+    uint outFrameIndex = gid >> 1u;    // Output frame index
+
+    // Map output frame to nearest input frame using integer division
+    uint inFrame = (outFrameIndex * pc.inFrameCount) / pc.outFrameCount;
+    
+    // Clamp to valid range
+    if (inFrame >= pc.inFrameCount) {
+        inFrame = pc.inFrameCount - 1u;
+    }
+    
+    // Copy nearest sample
+    outSamples[gid] = inSamples[inFrame * 2u + channel];
+}

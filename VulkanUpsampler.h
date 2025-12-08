@@ -249,7 +249,7 @@ class VulkanUpsampler : public GpuUpsampler
     uint32_t currentSlotIndex = 0; // Round-robin slot selection
 
     // === Async Sequencing ===
-    uint64_t nextSequenceId = 0;
+    std::atomic<uint64_t> nextSequenceId{0};
 
     // Queue to track submission order for result retrieval
     struct PendingWork

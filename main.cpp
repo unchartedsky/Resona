@@ -1,4 +1,4 @@
-﻿#define NOMINMAX
+#define NOMINMAX
 
 #include <algorithm>
 #include <atomic>
@@ -216,7 +216,7 @@ class GpuProcessingThread
         thread = std::thread([this]() {
 // Set high priority for GPU processing thread
 #ifdef _WIN32
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 #endif
 
             printf("[+] GPU processing thread started (adaptive mode)\n");

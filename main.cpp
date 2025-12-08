@@ -216,7 +216,7 @@ class GpuProcessingThread
         thread = std::thread([this]() {
 // Set high priority for GPU processing thread
 #ifdef _WIN32
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGH);
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 #endif
 
             printf("[+] GPU processing thread started (adaptive mode)\n");

@@ -265,6 +265,14 @@ bool VulkanUpsampler::selectPhysicalDevice()
     VkPhysicalDeviceProperties deviceProps;
     vkGetPhysicalDeviceProperties(physicalDevice, &deviceProps);
     printf("[+] Selected GPU: %s\n", deviceProps.deviceName);
+    if (deviceProps.apiVersion < VulkanConfig::API_VERSION)
+    {
+        printf("[!] Selected GPU does not support required Vulkan API version 1.2 (supported: %d.%d.%d)\n",
+               VK_VERSION_MAJOR(deviceProps.apiVersion),
+               VK_VERSION_MINOR(deviceProps.apiVersion),
+               VK_VERSION_PATCH(deviceProps.apiVersion));
+        return false;
+    }
 
     return true;
 }

@@ -64,6 +64,8 @@ static constexpr uint32_t GPU_THREAD_SLEEP_MS = 1;
 // === Global State ===
 std::atomic<bool> g_running{true};
 std::atomic<bool> g_underrun{false};
+std::atomic<bool> g_restartRequested{false};
+std::atomic<bool> g_restartInProgress{false};
 std::atomic<bool> g_cpuReady{false};
 std::atomic<bool> g_gpuReady{false};
 std::atomic<uint64_t> g_capturedInputFrames{0};   // Track total captured input frames
@@ -714,17 +716,28 @@ void runMainLoop(AudioDeviceManager &deviceManager)
             printf("\r%*s\r", 120, ""); // Clear line with spaces
             printf("[!] Underrun detected. Re-buffering...\n");
 
-            // Async restart - don't block main loop
-            std::thread([&deviceManager]() {
-                if (deviceManager.restartPlayback())
-                {
-                    printf("[+] Playback resumed after underrun\n");
-                }
-                else
-                {
-                    printf("[!] Failed to restart playback after underrun\n");
-                }
-            }).detach();
+            // Request a restart to be handled from the main loop.
+            // This avoids detached threads outliving deviceManager during shutdown.
+            g_restartRequested.store(true, std::memory_order_release);
+        }
+
+        if (g_restartRequested.load(std::memory_order_acquire) &&
+            !g_restartInProgress.exchange(true, std::memory_order_acq_rel))
+        {
+            g_restartRequested.store(false, std::memory_order_release);
+
+            if (deviceManager.restartPlayback())
+            {
+                printf("[+] Playback resumed after underrun\n");
+                g_restartInProgress.store(false, std::memory_order_release);
+            }
+            else
+            {
+                printf("[!] Failed to restart playback after underrun\n");
+                g_running.store(false, std::memory_order_release);
+                g_restartInProgress.store(false, std::memory_order_release);
+                break;
+            }
         }
 
         // Non-blocking status report (every ~500ms)

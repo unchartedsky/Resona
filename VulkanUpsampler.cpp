@@ -842,9 +842,18 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples, uint32_t
     const uint32_t groupCount = (outSamples + VulkanConfig::WORKGROUP_SIZE - 1) / VulkanConfig::WORKGROUP_SIZE;
     vkCmdDispatch(slot.commandBuffer, groupCount, 1, 1);
 
-    // OPTIMIZED: Remove output barrier completely!
-    // The fence wait before CPU reads the data is sufficient synchronization.
-    // Pipeline barriers here only add overhead without benefit.
+    // OPTIMIZED: No explicit output pipeline barrier.
+    // Synchronization contract for slot.outputBuffer / slot.outputPtr:
+    // 1. GPU completion is observed ONLY via slot.fence for this submission.
+    // 2. CPU access to slot.outputPtr must happen only after that fence is signaled.
+    // 3. For non-coherent memory, CPU access must also be preceded by
+    //    vkInvalidateMappedMemoryRanges() on the written range.
+    // 4. Under the current design, slot.outputPtr is read only from poll(),
+    //    tryPollAll(), and the zero-copy callback path, all of which first
+    //    confirm fence completion and perform invalidate when required.
+    // If any future code path reads slot.outputPtr without that fence/invalidate
+    // contract, this optimization becomes invalid and an explicit output barrier
+    // or stricter access encapsulation should be restored.
 
     // End command buffer
     if (vkEndCommandBuffer(slot.commandBuffer) != VK_SUCCESS)
@@ -1114,7 +1123,9 @@ size_t VulkanUpsampler::tryPollAll()
             continue;
         }
 
-        // ZERO-COPY OPTIMIZATION: Work completed - process directly from GPU memory
+        // ZERO-COPY OPTIMIZATION: Work completed - process directly from GPU memory.
+        // IMPORTANT: This path is only valid because fenceStatus was checked above
+        // and confirmed as VK_SUCCESS for this slot before any CPU read occurs.
         const uint32_t total = slot.expectedOutSamples;
 
         if (!slot.outputPtr) [[unlikely]]
@@ -1131,7 +1142,10 @@ size_t VulkanUpsampler::tryPollAll()
             continue;
         }
 
-        // OPTIMIZED: Only invalidate if memory is non-coherent
+        // OPTIMIZED: Only invalidate if memory is non-coherent.
+        // For the zero-copy callback path, fence completion + invalidate (when
+        // required) is the full synchronization contract before exposing
+        // slot.outputPtr to CPU code.
         if (!(outputMemoryProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
         {
             VkMappedMemoryRange range{};
@@ -1173,7 +1187,9 @@ size_t VulkanUpsampler::tryPollAll()
         const uint32_t copySamples = total - slot.skipOffset;
         const uint32_t outputFrames = copySamples / numChannels;
 
-        // ZERO-COPY: Invoke callback directly with GPU memory pointer (offset applied)
+        // ZERO-COPY: Invoke callback directly with GPU memory pointer (offset applied).
+        // The callback must treat this pointer as valid only for the duration of
+        // the callback and must not assume any access before fence completion.
         if (slot.callback)
         {
             const float *outputPtr = static_cast<const float *>(slot.outputPtr) + slot.skipOffset;

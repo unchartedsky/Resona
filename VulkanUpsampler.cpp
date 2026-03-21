@@ -1545,7 +1545,7 @@ void VulkanUpsampler::updateAdaptiveParams(uint32_t outputBufferLevel, uint32_t 
 uint32_t VulkanUpsampler::getRecommendedBatchSize() const
 {
     // Fixed batch size for consistent performance
-    return 1536;
+    return 512;
 }
 
 // === NEW: Adaptive Ratio Adjustment Implementation ===

@@ -50,6 +50,15 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
     VkDeviceSize inputSize = maxInputSamples * sizeof(float);
     VkDeviceSize outputSize = maxOutputSamples * sizeof(float);
 
+    auto rollbackInitialization = [this](uint32_t lastSlotIndex) {
+        for (uint32_t j = 0; j <= lastSlotIndex && j < NUM_SLOTS; ++j)
+        {
+            cleanupGpuSlot(slots[j]);
+        }
+
+        cleanupVulkan();
+    };
+
     for (uint32_t i = 0; i < NUM_SLOTS; ++i)
     {
         // Create fence for async synchronization
@@ -58,6 +67,7 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
         if (vkCreateFence(device, &fenceInfo, nullptr, &slots[i].fence) != VK_SUCCESS)
         {
             printf("[!] Failed to create fence for slot %u\n", i);
+            rollbackInitialization(i);
             return false;
         }
 
@@ -65,12 +75,14 @@ bool VulkanUpsampler::initialize(uint32_t inputRate, uint32_t outputRate, uint32
         if (!createBuffer(inputSize, slots[i].inputBuffer, slots[i].inputMemory, &slots[i].inputPtr, "slot.input"))
         {
             printf("[!] Failed to create input buffer for slot %u\n", i);
+            rollbackInitialization(i);
             return false;
         }
 
         if (!createBuffer(outputSize, slots[i].outputBuffer, slots[i].outputMemory, &slots[i].outputPtr, "slot.output"))
         {
             printf("[!] Failed to create output buffer for slot %u\n", i);
+            rollbackInitialization(i);
             return false;
         }
 

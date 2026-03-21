@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -704,27 +705,50 @@ void runMainLoop(AudioDeviceManager &deviceManager)
     auto startTime = std::chrono::steady_clock::now();
     uint32_t lastInputBufferLevel = 0;
     uint32_t lastOutputBufferLevel = 0;
+    std::future<bool> restartFuture;
 
     while (g_running)
     {
         // Non-blocking underrun check
         if (g_underrun.exchange(false))
         {
-            // Clear current line first, then print underrun message
-            printf("\r%*s\r", 120, ""); // Clear line with spaces
-            printf("[!] Underrun detected. Re-buffering...\n");
-
-            // Async restart - don't block main loop
-            std::thread([&deviceManager]() {
-                if (deviceManager.restartPlayback())
+            // If a previous restart is still in flight, collect its result first
+            if (restartFuture.valid())
+            {
+                const bool prevSuccess = restartFuture.get();
+                if (prevSuccess)
                 {
                     printf("[+] Playback resumed after underrun\n");
                 }
                 else
                 {
-                    printf("[!] Failed to restart playback after underrun\n");
+                    printf("[!] Previous playback restart failed\n");
                 }
-            }).detach();
+            }
+
+            // Clear current line first, then print underrun message
+            printf("\r%*s\r", 120, ""); // Clear line with spaces
+            printf("[!] Underrun detected. Re-buffering...\n");
+
+            // Async restart using std::async - joinable and result is trackable
+            restartFuture = std::async(std::launch::async, [&deviceManager]() -> bool {
+                return deviceManager.restartPlayback();
+            });
+        }
+
+        // Report result of completed restart without blocking the main loop
+        if (restartFuture.valid() &&
+            restartFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        {
+            const bool success = restartFuture.get();
+            if (success)
+            {
+                printf("[+] Playback resumed after underrun\n");
+            }
+            else
+            {
+                printf("[!] Failed to restart playback after underrun\n");
+            }
         }
 
         // Non-blocking status report (every ~500ms)
@@ -781,6 +805,20 @@ void runMainLoop(AudioDeviceManager &deviceManager)
         std::this_thread::sleep_for(std::chrono::milliseconds(AudioConfig::MAIN_LOOP_SLEEP_MS));
     }
     printf("\n");
+
+    // Wait for any in-flight restart to complete before exiting
+    if (restartFuture.valid())
+    {
+        const bool success = restartFuture.get();
+        if (success)
+        {
+            printf("[+] Playback resumed after underrun\n");
+        }
+        else
+        {
+            printf("[!] Failed to restart playback after underrun\n");
+        }
+    }
 
     // Print final statistics
     auto totalElapsed =

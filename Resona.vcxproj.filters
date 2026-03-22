@@ -44,5 +44,6 @@
       <Filter>Shader Files</Filter>
     </None>
     <None Include=".github\copilot-instructions.md" />
+    <None Include="AGENTS.md" />
   </ItemGroup>
 </Project>

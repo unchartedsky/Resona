@@ -96,13 +96,7 @@ class VulkanUpsampler : public GpuUpsampler
     /// @brief Reset adaptive target capture (force re-capture)
     void resetAdaptiveTarget();
 
-    // === Low-level API (for manual control) ===
-    bool enqueue(const float *input, uint32_t inputFrames);
-
     void shutdown() override;
-
-    /// @brief Create shader module from SPIR-V bytecode file
-    VkShaderModule createShaderModule(const std::string &filename);
 
   private:
     // === Initialization and Cleanup ===
@@ -115,6 +109,9 @@ class VulkanUpsampler : public GpuUpsampler
 
     /// @brief Clean up compute pipeline objects
     void cleanupPipeline();
+
+    /// @brief Create shader module from SPIR-V bytecode file
+    VkShaderModule createShaderModule(const std::string &filename);
 
     void cleanupSlotBuffers(GpuSlot &slotRef);
 
@@ -164,6 +161,9 @@ class VulkanUpsampler : public GpuUpsampler
     /// @param outSamples Output sample count
     /// @param slotIndex Target slot index
     bool dispatch(uint32_t inSamples, uint32_t outSamples, uint32_t slotIndex);
+
+    // === Internal Submission API ===
+    bool enqueue(const float *input, uint32_t inputFrames);
 
     // === Slot Management ===
 

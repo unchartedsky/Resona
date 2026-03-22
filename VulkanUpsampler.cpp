@@ -1559,20 +1559,19 @@ void VulkanUpsampler::updateAdaptiveParams(uint32_t outputBufferLevel, uint32_t 
     //   causing large audible pitch or speed changes.
     // - Keep a deadband near target so small fluctuations do not modulate ratio.
     // - Smooth ratio changes over time to avoid abrupt transitions.
-    constexpr float deadbandPressure = 0.98f;
-    constexpr float maxBoost = 0.002f;        // Max +0.2% boost when buffer is critically low
-    constexpr float smoothingFactor = 0.05f;  // Slow drift toward target ratio
-
     float targetRatio = adaptiveState.baseRatio;
-    if (adaptiveState.bufferPressure < deadbandPressure)
+    if (adaptiveState.bufferPressure < AdaptivePolicy::DriftDeadbandPressure)
     {
-        const float normalizedDeficit = (deadbandPressure - adaptiveState.bufferPressure) / deadbandPressure;
-        const float boostFactor = normalizedDeficit * maxBoost;
+        const float normalizedDeficit =
+            (AdaptivePolicy::DriftDeadbandPressure - adaptiveState.bufferPressure) /
+            AdaptivePolicy::DriftDeadbandPressure;
+        const float boostFactor = normalizedDeficit * AdaptivePolicy::DriftMaxBoost;
         targetRatio = adaptiveState.baseRatio * (1.0f + boostFactor);
     }
 
     adaptiveState.currentRatio =
-        adaptiveState.currentRatio * (1.0f - smoothingFactor) + targetRatio * smoothingFactor;
+        adaptiveState.currentRatio * (1.0f - AdaptivePolicy::DriftSmoothingFactor) +
+        targetRatio * AdaptivePolicy::DriftSmoothingFactor;
 
     // Enable adaptive mode
     adaptiveEnabled.store(true, std::memory_order_release);

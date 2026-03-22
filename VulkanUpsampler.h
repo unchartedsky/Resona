@@ -48,6 +48,23 @@ struct GpuSlot
 class VulkanUpsampler : public GpuUpsampler
 {
   public:
+    struct AdaptivePolicy
+    {
+        static constexpr uint32_t FixedBatchFrames = 512;
+        static constexpr uint32_t TargetBufferPercent = 30;
+        static constexpr uint32_t MaxSubmittedBatches = 4;
+
+        static constexpr float SubmitCriticalThreshold = 0.4f;
+        static constexpr float SubmitLowThreshold = 0.7f;
+
+        static constexpr float SleepCriticalThreshold = 0.3f;
+        static constexpr float SleepLowThreshold = 0.6f;
+
+        static constexpr float DriftDeadbandPressure = 0.98f;
+        static constexpr float DriftMaxBoost = 0.002f;
+        static constexpr float DriftSmoothingFactor = 0.05f;
+    };
+
     // ZERO-COPY OPTIMIZATION: Callback receives direct pointer to GPU-mapped memory
     // WARNING: Pointer is only valid during callback execution!
     // Data must be consumed or copied within callback before returning.

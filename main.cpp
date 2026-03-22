@@ -60,9 +60,6 @@ static constexpr uint32_t MAIN_LOOP_SLEEP_MS = 10;
 // GPU processing thread sleep interval when no work available
 static constexpr uint32_t GPU_THREAD_SLEEP_MS = 1;
 
-// Fixed GPU batch size in input frames.
-// Submission count is adaptive; batch size itself is intentionally fixed.
-static constexpr uint32_t GPU_BATCH_FRAMES = 512;
 } // namespace AudioConfig
 
 // === Global State ===
@@ -247,11 +244,11 @@ class GpuProcessingThread
                 // REDUCED TARGET: 30% instead of 50% to prevent overgeneration
                 // Lower target = less aggressive frame generation = less audio distortion
                 const uint32_t targetBufferFrames =
-                    AudioConfig::OUTPUT_RING_BUFFER_FRAMES * 30 / 100; // Target 30% full
+                    AudioConfig::OUTPUT_RING_BUFFER_FRAMES * VulkanUpsampler::AdaptivePolicy::TargetBufferPercent / 100;
 
                 vulkanUpsampler->updateAdaptiveParams(outputBufferFrames, targetBufferFrames);
 
-                const uint32_t batchFrames = AudioConfig::GPU_BATCH_FRAMES;
+                const uint32_t batchFrames = VulkanUpsampler::AdaptivePolicy::FixedBatchFrames;
                 const uint32_t batchSamples = batchFrames * AudioConfig::CHANNELS;
 
                 // Adapt submission count based on output buffer pressure and available slots.
@@ -260,12 +257,13 @@ class GpuProcessingThread
 
                 // Determine how many fixed-size batches to submit based on buffer state.
                 uint32_t batchesToSubmit = 1;
-                if (bufferRatio < 0.4f && availableSlots > 3)
+                if (bufferRatio < VulkanUpsampler::AdaptivePolicy::SubmitCriticalThreshold && availableSlots > 3)
                 {
-                    // Critical: Submit as many batches as we can (up to 4)
-                    batchesToSubmit = std::min(static_cast<uint32_t>(availableSlots), 4u);
+                    // Critical: Submit as many batches as we can.
+                    batchesToSubmit = std::min(static_cast<uint32_t>(availableSlots),
+                                               VulkanUpsampler::AdaptivePolicy::MaxSubmittedBatches);
                 }
-                else if (bufferRatio < 0.7f && availableSlots > 2)
+                else if (bufferRatio < VulkanUpsampler::AdaptivePolicy::SubmitLowThreshold && availableSlots > 2)
                 {
                     // Low: Submit 2-3 batches
                     batchesToSubmit = std::min(static_cast<uint32_t>(availableSlots), 3u);
@@ -352,12 +350,12 @@ class GpuProcessingThread
                 // Adaptive sleep: sleep less when buffer is low, more when buffer is high
                 uint32_t sleepMs = 0;
 
-                if (bufferRatio < 0.3f)
+                if (bufferRatio < VulkanUpsampler::AdaptivePolicy::SleepCriticalThreshold)
                 {
                     // Critical: No sleep - process as fast as possible
                     sleepMs = 0;
                 }
-                else if (bufferRatio < 0.6f)
+                else if (bufferRatio < VulkanUpsampler::AdaptivePolicy::SleepLowThreshold)
                 {
                     // Medium: Short sleep
                     sleepMs = 1;
@@ -749,7 +747,7 @@ void runMainLoop(AudioDeviceManager &deviceManager)
 
             const auto *vulkanUpsampler = static_cast<VulkanUpsampler *>(g_upsampler.get());
             const size_t availableSlots = vulkanUpsampler->getAvailableSlots();
-            const uint32_t batchSize = AudioConfig::GPU_BATCH_FRAMES;
+            const uint32_t batchSize = VulkanUpsampler::AdaptivePolicy::FixedBatchFrames;
             const float currentRatio = vulkanUpsampler->getCurrentRatio();
 
             // Calculate buffer fill rates (frames per second)

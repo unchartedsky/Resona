@@ -494,12 +494,10 @@ bool VulkanUpsampler::createBuffer(VkDeviceSize size, VkBuffer &buffer, VkDevice
     const bool isOutputBuffer = labelStr.find("output") != std::string::npos;
 
     uint32_t memoryTypeIndex;
-    bool foundReBar = false;
 
     try
     {
         memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, BUFFER_MEMORY_PROPS_REBAR);
-        foundReBar = true;
         if (isInputBuffer)
         {
             printf("[+] Using ReBAR memory (DEVICE_LOCAL + HOST_VISIBLE) for %s\n", label);

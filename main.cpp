@@ -327,7 +327,7 @@ class GpuProcessingThread
                     // Submit to GPU for processing (async)
                     uint64_t sequenceId = vulkanUpsampler->processAsync(
                         inputBuffer.data() + (i * batchSamples), readFrames,
-                        [readFrames](const float *output, uint32_t outputFrames) {
+                        [readFrames = readFrames](const float *output, uint32_t outputFrames) {
                             // Callback executes when GPU work completes
                             const uint32_t outputSamples = outputFrames * AudioConfig::CHANNELS;
                             g_outputRing.push(output, outputSamples);

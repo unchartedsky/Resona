@@ -140,7 +140,6 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="miniaudio.h" />
-    <ClInclude Include="PassthroughUpsampler.h" />
     <ClInclude Include="VulkanUpsampler.h" />
   </ItemGroup>
   <ItemGroup>

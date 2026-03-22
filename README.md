@@ -5,12 +5,19 @@ Resona is a GPU-accelerated audio resampling and sound modeling engine, built fo
 ### Third-party dependencies
 
 - [miniaudio](https://github.com/mackron/miniaudio) — Not included.  
-  Please download `miniaudio.h` manually and place it in the root directory.
+  Please download `miniaudio.h` manually and place it in the root directory.  
+  - ✅ Verified with: **miniaudio v0.11.25**  
+  - 🔍 Version check:  
+    - Open `miniaudio.h` and check the header comment near the top of the file  
+    - Expected format example: `miniaudio - v0.11.25 - 2026-03-04`
 
 - **Vulkan SDK** — Required for compute shader execution.  
   - ✅ Verified with: **Vulkan SDK 1.4.328.1** (Tested on AMD Radeon RX9070)  
   - ✅ Minimum required: **Vulkan 1.2**  
   - 🔗 Download: https://vulkan.lunarg.com/  
+  - 🔍 Version check:  
+    - Run `vulkaninfo`  
+    - Or confirm the installed SDK path/version under `C:\VulkanSDK\<version>\`
   > Make sure your GPU driver supports Vulkan 1.2 or later.  
   > You can check your system support using `vulkaninfo`.
 

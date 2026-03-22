@@ -1603,23 +1603,25 @@ void VulkanUpsampler::updateAdaptiveParams(uint32_t outputBufferLevel, uint32_t 
 
     // === ADAPTIVE RATIO ADJUSTMENT ===
     // Strategy:
-    // - If below target: Increase ratio to generate more samples (catch up)
-    // - If at/above target: Use base ratio (maintain) - NEVER decrease below base
+    // - Use a very small drift correction only when buffer level is meaningfully
+    //   below target. This compensates for DAC / driver clock mismatches without
+    //   causing large audible pitch or speed changes.
+    // - Keep a deadband near target so small fluctuations do not modulate ratio.
+    // - Smooth ratio changes over time to avoid abrupt transitions.
+    constexpr float deadbandPressure = 0.98f;
+    constexpr float maxBoost = 0.002f;        // Max +0.2% boost when buffer is critically low
+    constexpr float smoothingFactor = 0.05f;  // Slow drift toward target ratio
 
-    if (adaptiveState.bufferPressure < 1.0f)
+    float targetRatio = adaptiveState.baseRatio;
+    if (adaptiveState.bufferPressure < deadbandPressure)
     {
-        // Below target: Increase ratio linearly based on emptiness
-        // Max boost: 5% when buffer is empty
-        const float maxBoost = 0.05f;
-        const float boostFactor = (1.0f - adaptiveState.bufferPressure) * maxBoost;
+        const float normalizedDeficit = (deadbandPressure - adaptiveState.bufferPressure) / deadbandPressure;
+        const float boostFactor = normalizedDeficit * maxBoost;
+        targetRatio = adaptiveState.baseRatio * (1.0f + boostFactor);
+    }
 
-        adaptiveState.currentRatio = adaptiveState.baseRatio * (1.0f + boostFactor);
-    }
-    else
-    {
-        // At or above target: Maintain base ratio
-        adaptiveState.currentRatio = adaptiveState.baseRatio;
-    }
+    adaptiveState.currentRatio =
+        adaptiveState.currentRatio * (1.0f - smoothingFactor) + targetRatio * smoothingFactor;
 
     // Enable adaptive mode
     adaptiveEnabled.store(true, std::memory_order_release);

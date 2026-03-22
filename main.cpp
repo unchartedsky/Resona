@@ -805,7 +805,7 @@ void runMainLoop(AudioDeviceManager &deviceManager)
     if (totalElapsed > 0)
     {
         printf("[+] Session statistics:\n");
-        printf("    Runtime: %lld seconds\n", totalElapsed);
+        printf("    Runtime: %lld seconds\n", static_cast<long long>(totalElapsed));
         printf("    Captured: %llu frames (%.1f fps avg)\n", totalCaptured,
                totalCaptured / static_cast<double>(totalElapsed));
         printf("    Processed: %llu frames (%.1f fps avg)\n", totalProcessed,

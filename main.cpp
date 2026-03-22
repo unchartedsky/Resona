@@ -66,7 +66,6 @@ std::atomic<bool> g_running{true};
 std::atomic<bool> g_underrun{false};
 std::atomic<bool> g_restartRequested{false};
 std::atomic<bool> g_restartInProgress{false};
-std::atomic<bool> g_cpuReady{false};
 std::atomic<bool> g_gpuReady{false};
 std::atomic<uint64_t> g_capturedInputFrames{0};   // Track total captured input frames
 std::atomic<uint64_t> g_processedInputFrames{0};  // Track total processed input frames
@@ -312,7 +311,6 @@ class GpuProcessingThread
                 }
 
                 // Submit multiple batches
-                uint32_t successfulSubmissions = 0;
                 for (uint32_t i = 0; i < batchesToSubmit; ++i)
                 {
                     // Read input data from input ring buffer
@@ -337,11 +335,7 @@ class GpuProcessingThread
                             g_processedOutputFrames.fetch_add(outputFrames, std::memory_order_relaxed);
                         });
 
-                    if (sequenceId != 0)
-                    {
-                        successfulSubmissions++;
-                    }
-                    else
+                    if (sequenceId == 0)
                     {
                         // Failed to submit - GPU slots busy, stop trying
                         break;

@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <functional>
+#include <mutex>
 #include <queue>
 #include <string>
 #include <vector>
@@ -258,6 +259,7 @@ class VulkanUpsampler : public GpuUpsampler
         uint64_t sequenceId;
     };
     std::queue<PendingWork> pendingQueue;
+    mutable std::mutex pendingQueueMutex;
 
     // === Adaptive Processing State ===
     struct AdaptiveState

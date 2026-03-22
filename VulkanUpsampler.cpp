@@ -973,7 +973,10 @@ bool VulkanUpsampler::enqueue(const float *input, uint32_t inputFrames)
     slot.expectedOutSamples = outSamples;
     slot.skipOffset = skipOffset;
 
-    pendingQueue.push({static_cast<uint32_t>(slotIndex), slot.sequenceId});
+    {
+        std::lock_guard<std::mutex> lock(pendingQueueMutex);
+        pendingQueue.push({static_cast<uint32_t>(slotIndex), slot.sequenceId});
+    }
 
     // Update round-robin index
     currentSlotIndex = (slotIndex + 1) % NUM_SLOTS;
@@ -988,20 +991,28 @@ bool VulkanUpsampler::poll(bool &ready, float *output, uint32_t &outputFrames)
     ready = false;
 
     // Check if there are any pending works
-    if (pendingQueue.empty())
+    PendingWork work{};
     {
-        return true;
-    }
+        std::lock_guard<std::mutex> lock(pendingQueueMutex);
+        if (pendingQueue.empty())
+        {
+            return true;
+        }
 
-    // Get the oldest pending work (FIFO order)
-    const PendingWork &work = pendingQueue.front();
+        // Get the oldest pending work (FIFO order)
+        work = pendingQueue.front();
+    }
     const uint32_t slotIndex = work.slotIndex;
     GpuSlot &slot = slots[slotIndex];
 
     if (!slot.inFlight)
     {
         // Slot already processed - pop and continue
-        pendingQueue.pop();
+        std::lock_guard<std::mutex> lock(pendingQueueMutex);
+        if (!pendingQueue.empty())
+        {
+            pendingQueue.pop();
+        }
         return true;
     }
 
@@ -1018,7 +1029,11 @@ bool VulkanUpsampler::poll(bool &ready, float *output, uint32_t &outputFrames)
     {
         printf("[!] Fence status error for slot %u: %d\n", slotIndex, fenceStatus);
         slot.inFlight = false;
-        pendingQueue.pop();
+        std::lock_guard<std::mutex> lock(pendingQueueMutex);
+        if (!pendingQueue.empty())
+        {
+            pendingQueue.pop();
+        }
         return false;
     }
 
@@ -1031,7 +1046,11 @@ bool VulkanUpsampler::poll(bool &ready, float *output, uint32_t &outputFrames)
     if (!downloadOutputFromGPU(tempOutput.data(), total, slotIndex))
     {
         slot.inFlight = false;
-        pendingQueue.pop();
+        std::lock_guard<std::mutex> lock(pendingQueueMutex);
+        if (!pendingQueue.empty())
+        {
+            pendingQueue.pop();
+        }
         return false;
     }
 
@@ -1054,7 +1073,13 @@ bool VulkanUpsampler::poll(bool &ready, float *output, uint32_t &outputFrames)
     slot.expectedOutSamples = 0;
     slot.skipOffset = 0;
 
-    pendingQueue.pop();
+    {
+        std::lock_guard<std::mutex> lock(pendingQueueMutex);
+        if (!pendingQueue.empty())
+        {
+            pendingQueue.pop();
+        }
+    }
     ready = true;
     return true;
 }
@@ -1076,9 +1101,19 @@ uint64_t VulkanUpsampler::processAsync(const float *input, uint32_t inputFrames,
     }
 
     // Get the most recently submitted work
-    if (!pendingQueue.empty())
+    PendingWork work{};
+    bool hasPendingWork = false;
     {
-        const PendingWork &work = pendingQueue.back();
+        std::lock_guard<std::mutex> lock(pendingQueueMutex);
+        if (!pendingQueue.empty())
+        {
+            work = pendingQueue.back();
+            hasPendingWork = true;
+        }
+    }
+
+    if (hasPendingWork)
+    {
         GpuSlot &slot = slots[work.slotIndex];
 
         // Store callback for later invocation
@@ -1098,16 +1133,29 @@ size_t VulkanUpsampler::tryPollAll()
     size_t completedCount = 0;
 
     // Check all pending works (FIFO order)
-    while (!pendingQueue.empty())
+    while (true)
     {
-        const PendingWork &work = pendingQueue.front();
+        PendingWork work{};
+        {
+            std::lock_guard<std::mutex> lock(pendingQueueMutex);
+            if (pendingQueue.empty())
+            {
+                break;
+            }
+            work = pendingQueue.front();
+        }
+
         const uint32_t slotIndex = work.slotIndex;
         GpuSlot &slot = slots[slotIndex];
 
         if (!slot.inFlight)
         {
             // Already processed
-            pendingQueue.pop();
+            std::lock_guard<std::mutex> lock(pendingQueueMutex);
+            if (!pendingQueue.empty())
+            {
+                pendingQueue.pop();
+            }
             continue;
         }
 
@@ -1131,7 +1179,11 @@ size_t VulkanUpsampler::tryPollAll()
             slot.skipOffset = 0;
             slot.callback = nullptr;
 
-            pendingQueue.pop();
+            std::lock_guard<std::mutex> lock(pendingQueueMutex);
+            if (!pendingQueue.empty())
+            {
+                pendingQueue.pop();
+            }
             continue;
         }
 
@@ -1150,7 +1202,11 @@ size_t VulkanUpsampler::tryPollAll()
             slot.skipOffset = 0;
             slot.callback = nullptr;
 
-            pendingQueue.pop();
+                std::lock_guard<std::mutex> lock(pendingQueueMutex);
+                if (!pendingQueue.empty())
+                {
+                    pendingQueue.pop();
+                }
             continue;
         }
 
@@ -1176,7 +1232,11 @@ size_t VulkanUpsampler::tryPollAll()
                 slot.skipOffset = 0;
                 slot.callback = nullptr;
 
+            std::lock_guard<std::mutex> lock(pendingQueueMutex);
+            if (!pendingQueue.empty())
+            {
                 pendingQueue.pop();
+            }
                 continue;
             }
         }
@@ -1215,7 +1275,13 @@ size_t VulkanUpsampler::tryPollAll()
         slot.skipOffset = 0;
         slot.callback = nullptr;
 
-        pendingQueue.pop();
+        {
+            std::lock_guard<std::mutex> lock(pendingQueueMutex);
+            if (!pendingQueue.empty())
+            {
+                pendingQueue.pop();
+            }
+        }
         ++completedCount;
     }
 
@@ -1352,20 +1418,6 @@ int VulkanUpsampler::findAvailableSlot()
                 slot.sequenceId = 0;
                 slot.expectedOutSamples = 0;
                 slot.skipOffset = 0;
-
-                // CRITICAL: Also remove from pending queue to prevent polling thread from re-processing
-                // This prevents race conditions and ensures clean state
-                std::queue<PendingWork> newQueue;
-                while (!pendingQueue.empty())
-                {
-                    const PendingWork &work = pendingQueue.front();
-                    if (work.slotIndex != slotIndex)
-                    {
-                        newQueue.push(work);
-                    }
-                    pendingQueue.pop();
-                }
-                pendingQueue = std::move(newQueue);
 
                 // Return this slot immediately for reuse
                 return static_cast<int>(slotIndex);

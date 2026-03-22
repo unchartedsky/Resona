@@ -81,10 +81,6 @@ class VulkanUpsampler : public GpuUpsampler
     /// @param targetBufferLevel Target buffer level in frames
     void updateAdaptiveParams(uint32_t outputBufferLevel, uint32_t targetBufferLevel);
 
-    /// @brief Get recommended batch size based on current adaptive state
-    /// @return Recommended batch size in frames
-    uint32_t getRecommendedBatchSize() const;
-
     /// @brief Get current adaptive ratio
     /// @return Current ratio being used for resampling
     float getCurrentRatio() const;

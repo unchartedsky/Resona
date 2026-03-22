@@ -59,6 +59,10 @@ static constexpr uint32_t MAIN_LOOP_SLEEP_MS = 10;
 
 // GPU processing thread sleep interval when no work available
 static constexpr uint32_t GPU_THREAD_SLEEP_MS = 1;
+
+// Fixed GPU batch size in input frames.
+// Submission count is adaptive; batch size itself is intentionally fixed.
+static constexpr uint32_t GPU_BATCH_FRAMES = 512;
 } // namespace AudioConfig
 
 // === Global State ===
@@ -235,8 +239,9 @@ class GpuProcessingThread
 
                 auto *vulkanUpsampler = static_cast<VulkanUpsampler *>(g_upsampler.get());
 
-                // === ADAPTIVE BATCH SIZING ===
-                // Update adaptive parameters based on current buffer state
+                // === OUTPUT BUFFER PRESSURE TRACKING ===
+                // Batch size is fixed. We adapt submission count and ratio drift
+                // correction based on buffer state.
                 const uint32_t outputBufferFrames = g_outputRing.available() / AudioConfig::CHANNELS;
 
                 // REDUCED TARGET: 30% instead of 50% to prevent overgeneration
@@ -246,22 +251,21 @@ class GpuProcessingThread
 
                 vulkanUpsampler->updateAdaptiveParams(outputBufferFrames, targetBufferFrames);
 
-                // Get recommended batch size based on buffer pressure
-                const uint32_t batchFrames = vulkanUpsampler->getRecommendedBatchSize();
+                const uint32_t batchFrames = AudioConfig::GPU_BATCH_FRAMES;
                 const uint32_t batchSamples = batchFrames * AudioConfig::CHANNELS;
 
-                // OPTIMIZATION: Submit multiple batches when buffer is low and slots are available
+                // Adapt submission count based on output buffer pressure and available slots.
                 const size_t availableSlots = vulkanUpsampler->getAvailableSlots();
                 const float bufferRatio = static_cast<float>(outputBufferFrames) / targetBufferFrames;
 
-                // Determine how many batches to submit based on buffer state and available slots
+                // Determine how many fixed-size batches to submit based on buffer state.
                 uint32_t batchesToSubmit = 1;
-                if (bufferRatio < 0.3f && availableSlots > 3)
+                if (bufferRatio < 0.4f && availableSlots > 3)
                 {
                     // Critical: Submit as many batches as we can (up to 4)
                     batchesToSubmit = std::min(static_cast<uint32_t>(availableSlots), 4u);
                 }
-                else if (bufferRatio < 0.5f && availableSlots > 2)
+                else if (bufferRatio < 0.7f && availableSlots > 2)
                 {
                     // Low: Submit 2-3 batches
                     batchesToSubmit = std::min(static_cast<uint32_t>(availableSlots), 3u);
@@ -745,7 +749,7 @@ void runMainLoop(AudioDeviceManager &deviceManager)
 
             const auto *vulkanUpsampler = static_cast<VulkanUpsampler *>(g_upsampler.get());
             const size_t availableSlots = vulkanUpsampler->getAvailableSlots();
-            const uint32_t batchSize = vulkanUpsampler->getRecommendedBatchSize();
+            const uint32_t batchSize = AudioConfig::GPU_BATCH_FRAMES;
             const float currentRatio = vulkanUpsampler->getCurrentRatio();
 
             // Calculate buffer fill rates (frames per second)

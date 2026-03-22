@@ -22,6 +22,8 @@ void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= pc.outFrameCount * 2) return;
 
+    if (pc.inFrameCount < 2u || pc.outFrameCount == 0u) return;
+
     uint channel = gid & 1;
     uint outFrameIndex = gid >> 1;
 

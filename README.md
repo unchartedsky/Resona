@@ -8,7 +8,7 @@ Resona is a GPU-accelerated audio resampling and sound modeling engine, built fo
   Please download `miniaudio.h` manually and place it in the root directory.
 
 - **Vulkan SDK** — Required for compute shader execution.  
-  - ✅ Verified with: **Vulkan SDK 1.4.321**  
+  - ✅ Verified with: **Vulkan SDK 1.4.328.1** (Tested on AMD Radeon RX9070)  
   - ✅ Minimum required: **Vulkan 1.2**  
   - 🔗 Download: https://vulkan.lunarg.com/  
   > Make sure your GPU driver supports Vulkan 1.2 or later.  
@@ -26,17 +26,20 @@ Resona uses **GLSL compute shaders** compiled to **SPIR-V** using `glslangValida
 ### 🛠 Compile Example
 
 ```bash
-glslangValidator -V linear.comp -o linear.spv
+glslangValidator -V nearest.comp -o nearest.spv
 ```
 
 ## 🔊 Current Audio Pipeline (Windows)
 
-Spotify → VB-CABLE → Resona → DAC
+Application (e.g. Spotify) → VB-CABLE → Resona → DAC
 
-- **Spotify**: Audio source  
+- **Application (Spotify, etc.)**:  
+  Any application that can select **VB-CABLE** as the output device via Windows Volume Mixer.
 - **VB-CABLE**: Virtual audio device for routing output  
 - **Resona**: GPU-based audio upsampler (Vulkan)  
-- **DAC**: Final audio output device
+- **DAC**: Final audio output device  
+  - Must support **384kHz** output.  
+  - ✅ Tested devices: **Questyle M12i**, **iFi Uno**
 
 ## 🪪 License
 

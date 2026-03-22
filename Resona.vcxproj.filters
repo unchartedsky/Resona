@@ -43,5 +43,9 @@
     <None Include="linear.comp">
       <Filter>Shader Files</Filter>
     </None>
+    <None Include="nearest.comp">
+      <Filter>Shader Files</Filter>
+    </None>
+    <None Include=".github\copilot-instructions.md" />
   </ItemGroup>
 </Project>

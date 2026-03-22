@@ -1,7 +1,7 @@
 ﻿#version 450
 layout(local_size_x = 64) in;
 
-// input: stereo interleaved (R0, L0, R1, L1, ...)
+// input: stereo interleaved (L0, R0, L1, R1, ...)
 layout(binding = 0) readonly buffer InputBuffer {
     float inSamples[];
 };
@@ -22,22 +22,35 @@ void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= pc.outFrameCount * 2) return;
 
-    uint channel = 1 - (gid & 1); // 0 = R, 1 = L (inverted because input is R0,L0,R1,L1 not L0,R0,L1,R1)
+    if (pc.inFrameCount < 2u || pc.outFrameCount == 0u) return;
+
+    uint channel = gid & 1;
     uint outFrameIndex = gid >> 1;
 
-    float inFrameIndex = float(outFrameIndex) / pc.ratio;
-    uint baseFrame = uint(inFrameIndex);
-    float frac = inFrameIndex - float(baseFrame);
-
-    uint maxSampleIndex = pc.inFrameCount * 2;
-    uint baseIndex = baseFrame * 2 + channel;
-    uint nextIndex = baseIndex + 2;
-
-    // Combined boundary checks for current and next samples
-    float s0 = (baseIndex < maxSampleIndex) ? inSamples[baseIndex] : 0.0;
-    float s1 = (nextIndex < maxSampleIndex) ? inSamples[nextIndex] : s0;
-
-    // Linear interpolation with clamp for safety
-    float mixed = fma(frac, s1 - s0, s0);
-    outSamples[gid] = max(-1.0, min(1.0, mixed));
+    // Integer position calculation (avoids float precision issues)
+    uint inFrame = (outFrameIndex * pc.inFrameCount) / pc.outFrameCount;
+    
+    // CRITICAL: Clamp inFrame so that inFrame + 1 is ALWAYS valid
+    uint maxValidFrame = pc.inFrameCount - 2;
+    if (inFrame > maxValidFrame) {
+        inFrame = maxValidFrame;
+    }
+    
+    // Both frame0 and frame1 are guaranteed valid
+    uint frame0 = inFrame;
+    uint frame1 = inFrame + 1;
+    
+    // Calculate fractional part using integer math
+    uint numerator = outFrameIndex * pc.inFrameCount;
+    uint remainder = numerator - (inFrame * pc.outFrameCount);
+    float frac = float(remainder) / float(pc.outFrameCount);
+    
+    // Fetch samples
+    float s0 = inSamples[frame0 * 2 + channel];
+    float s1 = inSamples[frame1 * 2 + channel];
+    
+    // Linear interpolation
+    float result = s0 + frac * (s1 - s0);
+    
+    outSamples[gid] = result;
 }

@@ -11,6 +11,7 @@
 
 struct GpuSlot
 {
+    mutable std::mutex stateMutex;
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
 

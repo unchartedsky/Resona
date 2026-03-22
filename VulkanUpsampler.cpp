@@ -779,10 +779,13 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples, uint32_t
     GpuSlot &slot = slots[slotIndex];
 
     // Ensure slot is not in-flight
-    if (slot.inFlight)
     {
-        printf("[!] Slot %u still in-flight\n", slotIndex);
-        return false;
+        std::lock_guard<std::mutex> lock(slot.stateMutex);
+        if (slot.inFlight)
+        {
+            printf("[!] Slot %u still in-flight\n", slotIndex);
+            return false;
+        }
     }
 
     // Wait for fence if it was previously used (should be signaled already)
@@ -890,7 +893,10 @@ bool VulkanUpsampler::dispatch(uint32_t inSamples, uint32_t outSamples, uint32_t
     }
 
     // Mark slot as in-flight
-    slot.inFlight = true;
+    {
+        std::lock_guard<std::mutex> lock(slot.stateMutex);
+        slot.inFlight = true;
+    }
     return true;
 }
 
@@ -917,9 +923,12 @@ bool VulkanUpsampler::enqueue(const float *input, uint32_t inputFrames)
 
     GpuSlot &slot = slots[slotIndex];
 
-    if (!slot.initialized)
     {
-        return false;
+        std::lock_guard<std::mutex> lock(slot.stateMutex);
+        if (!slot.initialized)
+        {
+            return false;
+        }
     }
 
     // Use adaptive ratio if enabled
@@ -972,13 +981,17 @@ bool VulkanUpsampler::enqueue(const float *input, uint32_t inputFrames)
     }
 
     // Track submission order
-    slot.sequenceId = nextSequenceId++;
-    slot.expectedOutSamples = outSamples;
-    slot.skipOffset = skipOffset;
+    uint64_t sequenceId = nextSequenceId++;
+    {
+        std::lock_guard<std::mutex> lock(slot.stateMutex);
+        slot.sequenceId = sequenceId;
+        slot.expectedOutSamples = outSamples;
+        slot.skipOffset = skipOffset;
+    }
 
     {
         std::lock_guard<std::mutex> lock(pendingQueueMutex);
-        pendingQueue.push({static_cast<uint32_t>(slotIndex), slot.sequenceId});
+        pendingQueue.push({static_cast<uint32_t>(slotIndex), sequenceId});
     }
 
     // Update round-robin index
@@ -1122,6 +1135,7 @@ uint64_t VulkanUpsampler::processAsync(const float *input, uint32_t inputFrames,
         // Store callback for later invocation
         if (callback)
         {
+            std::lock_guard<std::mutex> lock(slot.stateMutex);
             slot.callback = callback;
         }
 
@@ -1151,15 +1165,18 @@ size_t VulkanUpsampler::tryPollAll()
         const uint32_t slotIndex = work.slotIndex;
         GpuSlot &slot = slots[slotIndex];
 
-        if (!slot.inFlight)
         {
-            // Already processed
-            std::lock_guard<std::mutex> lock(pendingQueueMutex);
-            if (!pendingQueue.empty())
+            std::lock_guard<std::mutex> lock(slot.stateMutex);
+            if (!slot.inFlight)
             {
-                pendingQueue.pop();
+                // Already processed
+                std::lock_guard<std::mutex> queueLock(pendingQueueMutex);
+                if (!pendingQueue.empty())
+                {
+                    pendingQueue.pop();
+                }
+                continue;
             }
-            continue;
         }
 
         // Non-blocking check
@@ -1176,11 +1193,14 @@ size_t VulkanUpsampler::tryPollAll()
             printf("[!] Fence status error for slot %u: %d\n", slotIndex, fenceStatus);
 
             // Clear slot state and continue
-            slot.inFlight = false;
-            slot.sequenceId = 0;
-            slot.expectedOutSamples = 0;
-            slot.skipOffset = 0;
-            slot.callback = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(slot.stateMutex);
+                slot.inFlight = false;
+                slot.sequenceId = 0;
+                slot.expectedOutSamples = 0;
+                slot.skipOffset = 0;
+                slot.callback = nullptr;
+            }
 
             std::lock_guard<std::mutex> lock(pendingQueueMutex);
             if (!pendingQueue.empty())
@@ -1193,17 +1213,28 @@ size_t VulkanUpsampler::tryPollAll()
         // ZERO-COPY OPTIMIZATION: Work completed - process directly from GPU memory.
         // IMPORTANT: This path is only valid because fenceStatus was checked above
         // and confirmed as VK_SUCCESS for this slot before any CPU read occurs.
-        const uint32_t total = slot.expectedOutSamples;
+        uint32_t total = 0;
+        uint32_t skipOffset = 0;
+        std::function<void(const float *, uint32_t)> callback;
+        {
+            std::lock_guard<std::mutex> lock(slot.stateMutex);
+            total = slot.expectedOutSamples;
+            skipOffset = slot.skipOffset;
+            callback = slot.callback;
+        }
 
         if (!slot.outputPtr) [[unlikely]]
         {
             printf("[!] Output memory not mapped for slot %u\n", slotIndex);
 
-            slot.inFlight = false;
-            slot.sequenceId = 0;
-            slot.expectedOutSamples = 0;
-            slot.skipOffset = 0;
-            slot.callback = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(slot.stateMutex);
+                slot.inFlight = false;
+                slot.sequenceId = 0;
+                slot.expectedOutSamples = 0;
+                slot.skipOffset = 0;
+                slot.callback = nullptr;
+            }
 
                 std::lock_guard<std::mutex> lock(pendingQueueMutex);
                 if (!pendingQueue.empty())
@@ -1229,11 +1260,14 @@ size_t VulkanUpsampler::tryPollAll()
             {
                 printf("[!] Failed to invalidate output memory for slot %u\n", slotIndex);
 
-                slot.inFlight = false;
-                slot.sequenceId = 0;
-                slot.expectedOutSamples = 0;
-                slot.skipOffset = 0;
-                slot.callback = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(slot.stateMutex);
+                    slot.inFlight = false;
+                    slot.sequenceId = 0;
+                    slot.expectedOutSamples = 0;
+                    slot.skipOffset = 0;
+                    slot.callback = nullptr;
+                }
 
             std::lock_guard<std::mutex> lock(pendingQueueMutex);
             if (!pendingQueue.empty())
@@ -1245,38 +1279,44 @@ size_t VulkanUpsampler::tryPollAll()
         }
 
         // Apply skip offset validation
-        if (slot.skipOffset > total)
+        if (skipOffset > total)
         {
-            printf("[!] Skip offset %u exceeds total output %u for slot %u\n", slot.skipOffset, total, slotIndex);
+            printf("[!] Skip offset %u exceeds total output %u for slot %u\n", skipOffset, total, slotIndex);
 
-            slot.inFlight = false;
-            slot.sequenceId = 0;
-            slot.expectedOutSamples = 0;
-            slot.skipOffset = 0;
-            slot.callback = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(slot.stateMutex);
+                slot.inFlight = false;
+                slot.sequenceId = 0;
+                slot.expectedOutSamples = 0;
+                slot.skipOffset = 0;
+                slot.callback = nullptr;
+            }
 
             pendingQueue.pop();
             continue;
         }
 
-        const uint32_t copySamples = total - slot.skipOffset;
+        const uint32_t copySamples = total - skipOffset;
         const uint32_t outputFrames = copySamples / numChannels;
 
         // ZERO-COPY: Invoke callback directly with GPU memory pointer (offset applied).
         // The callback must treat this pointer as valid only for the duration of
         // the callback and must not assume any access before fence completion.
-        if (slot.callback)
+        if (callback)
         {
-            const float *outputPtr = static_cast<const float *>(slot.outputPtr) + slot.skipOffset;
-            slot.callback(outputPtr, outputFrames);
+            const float *outputPtr = static_cast<const float *>(slot.outputPtr) + skipOffset;
+            callback(outputPtr, outputFrames);
         }
 
         // Clear slot state - work complete
-        slot.inFlight = false;
-        slot.sequenceId = 0;
-        slot.expectedOutSamples = 0;
-        slot.skipOffset = 0;
-        slot.callback = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(slot.stateMutex);
+            slot.inFlight = false;
+            slot.sequenceId = 0;
+            slot.expectedOutSamples = 0;
+            slot.skipOffset = 0;
+            slot.callback = nullptr;
+        }
 
         {
             std::lock_guard<std::mutex> lock(pendingQueueMutex);
@@ -1296,6 +1336,7 @@ size_t VulkanUpsampler::getAvailableSlots() const
     size_t available = 0;
     for (uint32_t i = 0; i < NUM_SLOTS; ++i)
     {
+        std::lock_guard<std::mutex> lock(slots[i].stateMutex);
         if (!slots[i].inFlight)
         {
             ++available;
@@ -1363,9 +1404,12 @@ int VulkanUpsampler::findAvailableSlot()
     for (uint32_t i = 0; i < NUM_SLOTS; ++i)
     {
         const uint32_t slotIndex = (currentSlotIndex + i) % NUM_SLOTS;
-        if (!slots[slotIndex].inFlight)
         {
-            return static_cast<int>(slotIndex);
+            std::lock_guard<std::mutex> lock(slots[slotIndex].stateMutex);
+            if (!slots[slotIndex].inFlight)
+            {
+                return static_cast<int>(slotIndex);
+            }
         }
     }
 
@@ -1376,7 +1420,13 @@ int VulkanUpsampler::findAvailableSlot()
         const uint32_t slotIndex = (currentSlotIndex + i) % NUM_SLOTS;
         GpuSlot &slot = slots[slotIndex];
 
-        if (slot.fence != VK_NULL_HANDLE && slot.inFlight)
+        bool inFlight = false;
+        {
+            std::lock_guard<std::mutex> lock(slot.stateMutex);
+            inFlight = slot.inFlight;
+        }
+
+        if (slot.fence != VK_NULL_HANDLE && inFlight)
         {
             VkResult status = vkGetFenceStatus(device, slot.fence);
             if (status == VK_SUCCESS)
@@ -1385,10 +1435,18 @@ int VulkanUpsampler::findAvailableSlot()
                 // This is critical - poll thread might be too slow or blocked
 
                 // ZERO-COPY: Invoke callback directly with GPU memory if callback exists
-                if (slot.expectedOutSamples > 0 && slot.callback)
+                uint32_t total = 0;
+                uint32_t skipOffset = 0;
+                std::function<void(const float *, uint32_t)> callback;
                 {
-                    const uint32_t total = slot.expectedOutSamples;
+                    std::lock_guard<std::mutex> lock(slot.stateMutex);
+                    total = slot.expectedOutSamples;
+                    skipOffset = slot.skipOffset;
+                    callback = slot.callback;
+                }
 
+                if (total > 0 && callback)
+                {
                     if (slot.outputPtr)
                     {
                         // OPTIMIZED: Only invalidate if memory is non-coherent
@@ -1403,24 +1461,27 @@ int VulkanUpsampler::findAvailableSlot()
                         }
 
                         // Apply skip offset and invoke callback with direct pointer
-                        if (slot.skipOffset <= total)
+                        if (skipOffset <= total)
                         {
-                            const uint32_t copySamples = total - slot.skipOffset;
+                            const uint32_t copySamples = total - skipOffset;
                             const uint32_t outputFrames = copySamples / numChannels;
 
                             // ZERO-COPY: Pass GPU memory pointer directly (no intermediate copy!)
-                            const float *outputPtr = static_cast<const float *>(slot.outputPtr) + slot.skipOffset;
-                            slot.callback(outputPtr, outputFrames);
+                            const float *outputPtr = static_cast<const float *>(slot.outputPtr) + skipOffset;
+                            callback(outputPtr, outputFrames);
                         }
                     }
                 }
 
                 // Clear callback and mark as available
-                slot.callback = nullptr;
-                slot.inFlight = false;
-                slot.sequenceId = 0;
-                slot.expectedOutSamples = 0;
-                slot.skipOffset = 0;
+                {
+                    std::lock_guard<std::mutex> lock(slot.stateMutex);
+                    slot.callback = nullptr;
+                    slot.inFlight = false;
+                    slot.sequenceId = 0;
+                    slot.expectedOutSamples = 0;
+                    slot.skipOffset = 0;
+                }
 
                 // Return this slot immediately for reuse
                 return static_cast<int>(slotIndex);

@@ -499,6 +499,10 @@ bool VulkanUpsampler::createBuffer(VkDeviceSize size, VkBuffer &buffer, VkDevice
     // 2. HOST_VISIBLE + HOST_CACHED - Good performance
     // 3. HOST_VISIBLE + HOST_COHERENT - Fallback
 
+    const std::string labelStr(label);
+    const bool isInputBuffer = labelStr.find("input") != std::string::npos;
+    const bool isOutputBuffer = labelStr.find("output") != std::string::npos;
+
     uint32_t memoryTypeIndex;
     bool foundReBar = false;
 
@@ -506,7 +510,7 @@ bool VulkanUpsampler::createBuffer(VkDeviceSize size, VkBuffer &buffer, VkDevice
     {
         memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, BUFFER_MEMORY_PROPS_REBAR);
         foundReBar = true;
-        if (strcmp(label, "slot.input") == 0)
+        if (isInputBuffer)
         {
             printf("[+] Using ReBAR memory (DEVICE_LOCAL + HOST_VISIBLE) for %s\n", label);
         }
@@ -524,7 +528,7 @@ bool VulkanUpsampler::createBuffer(VkDeviceSize size, VkBuffer &buffer, VkDevice
             try
             {
                 memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, BUFFER_MEMORY_PROPS_FALLBACK);
-                if (strcmp(label, "slot.input") == 0)
+                if (isInputBuffer)
                 {
                     printf("[*] Using fallback memory for %s (ReBAR/cached not available)\n", label);
                 }
@@ -541,12 +545,11 @@ bool VulkanUpsampler::createBuffer(VkDeviceSize size, VkBuffer &buffer, VkDevice
     allocInfo.memoryTypeIndex = memoryTypeIndex;
 
     // Store memory properties for flush/invalidate operations
-    std::string labelStr(label);
-    if (labelStr.find("input") != std::string::npos)
+    if (isInputBuffer)
     {
         inputMemoryProperties = memProps.memoryTypes[memoryTypeIndex].propertyFlags;
     }
-    else if (labelStr.find("output") != std::string::npos)
+    else if (isOutputBuffer)
     {
         outputMemoryProperties = memProps.memoryTypes[memoryTypeIndex].propertyFlags;
     }

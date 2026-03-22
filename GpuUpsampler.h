@@ -24,16 +24,6 @@ public:
     /// @param kernel  The resample algorithm to use.
     virtual void setKernel(ResampleKernel kernel) = 0;
 
-    /// @brief Processes input audio and writes upsampled output (deprecated - use async API).
-    /// @deprecated Use VulkanUpsampler::processAsync() for better performance and non-blocking operation.
-    /// @param input          Pointer to interleaved input samples (float32).
-    /// @param inputFrames    Number of input frames (not samples).
-    /// @param output         Pointer to preallocated output buffer (float32).
-    /// @param outputFrames   Updated with number of output frames produced.
-    /// @return true if successful, false otherwise.
-    virtual bool process(const float* input, uint32_t inputFrames,
-        float* output, uint32_t& outputFrames) = 0;
-
     /// @brief Releases GPU resources and shuts down the upsampler.
     virtual void shutdown() = 0;
 };

@@ -60,10 +60,6 @@ class VulkanUpsampler : public GpuUpsampler
 
     void setKernel(ResampleKernel kernel) override;
 
-    // === Synchronous API (deprecated - empty stub) ===
-    [[deprecated("Use processAsync() for better performance and non-blocking operation")]]
-    bool process(const float *input, uint32_t inputFrames, float *output, uint32_t &outputFrames) override;
-
     // === Asynchronous API (new) ===
 
     /// @brief Submit work without waiting (fully async)
@@ -100,13 +96,8 @@ class VulkanUpsampler : public GpuUpsampler
     /// @brief Reset adaptive target capture (force re-capture)
     void resetAdaptiveTarget();
 
-    /// @brief Set ratio adjustment range
-    /// @param range Maximum adjustment range (e.g., 0.005 = ±0.5%)
-    void setRatioAdjustmentRange(float range);
-
     // === Low-level API (for manual control) ===
     bool enqueue(const float *input, uint32_t inputFrames);
-    bool poll(bool &ready, float *output, uint32_t &outputFrames);
 
     void shutdown() override;
 

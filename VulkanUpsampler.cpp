@@ -179,16 +179,6 @@ void VulkanUpsampler::setKernel(ResampleKernel kernel)
     printf("[+] Pipeline ready (%s kernel)\n", filename.c_str());
 }
 
-bool VulkanUpsampler::process(const float *input, uint32_t inputFrames, float *output, uint32_t &outputFrames)
-{
-    // Empty stub - deprecated, use processAsync() instead
-    (void)input;
-    (void)inputFrames;
-    (void)output;
-    (void)outputFrames;
-    return false;
-}
-
 void VulkanUpsampler::shutdown()
 {
     // Wait for all in-flight GPU work to complete before cleanup
@@ -1002,104 +992,6 @@ bool VulkanUpsampler::enqueue(const float *input, uint32_t inputFrames)
     return true;
 }
 
-bool VulkanUpsampler::poll(bool &ready, float *output, uint32_t &outputFrames)
-{
-    ready = false;
-
-    // Check if there are any pending works
-    PendingWork work{};
-    {
-        std::lock_guard<std::mutex> lock(pendingQueueMutex);
-        if (pendingQueue.empty())
-        {
-            return true;
-        }
-
-        // Get the oldest pending work (FIFO order)
-        work = pendingQueue.front();
-    }
-    const uint32_t slotIndex = work.slotIndex;
-    GpuSlot &slot = slots[slotIndex];
-
-    if (!slot.inFlight)
-    {
-        // Slot already processed - pop and continue
-        std::lock_guard<std::mutex> lock(pendingQueueMutex);
-        if (!pendingQueue.empty())
-        {
-            pendingQueue.pop();
-        }
-        return true;
-    }
-
-    // Non-blocking fence status check - immediately returns current state
-    VkResult fenceStatus = vkGetFenceStatus(device, slot.fence);
-
-    if (fenceStatus == VK_NOT_READY)
-    {
-        // GPU still working - return immediately without blocking
-        return true;
-    }
-
-    if (fenceStatus != VK_SUCCESS)
-    {
-        printf("[!] Fence status error for slot %u: %d\n", slotIndex, fenceStatus);
-        slot.inFlight = false;
-        std::lock_guard<std::mutex> lock(pendingQueueMutex);
-        if (!pendingQueue.empty())
-        {
-            pendingQueue.pop();
-        }
-        return false;
-    }
-
-    // Fence signaled - GPU work completed, download results
-    const uint32_t total = slot.expectedOutSamples;
-
-    // OPTIMIZED: Use temporary vector for output download
-    std::vector<float> tempOutput(total);
-
-    if (!downloadOutputFromGPU(tempOutput.data(), total, slotIndex))
-    {
-        slot.inFlight = false;
-        std::lock_guard<std::mutex> lock(pendingQueueMutex);
-        if (!pendingQueue.empty())
-        {
-            pendingQueue.pop();
-        }
-        return false;
-    }
-
-    // Apply skip offset and copy to output
-    if (slot.skipOffset > total)
-    {
-        printf("[!] Skip offset %u exceeds total output %u for slot %u\n", slot.skipOffset, total, slotIndex);
-        slot.inFlight = false;
-        pendingQueue.pop();
-        return false;
-    }
-
-    const uint32_t copySamples = total - slot.skipOffset;
-    std::memcpy(output, tempOutput.data() + slot.skipOffset, sizeof(float) * copySamples);
-    outputFrames = copySamples / numChannels;
-
-    // Clear slot state - work complete
-    slot.inFlight = false;
-    slot.sequenceId = 0;
-    slot.expectedOutSamples = 0;
-    slot.skipOffset = 0;
-
-    {
-        std::lock_guard<std::mutex> lock(pendingQueueMutex);
-        if (!pendingQueue.empty())
-        {
-            pendingQueue.pop();
-        }
-    }
-    ready = true;
-    return true;
-}
-
 // === Asynchronous API Implementation ===
 
 uint64_t VulkanUpsampler::processAsync(const float *input, uint32_t inputFrames, CompletionCallback callback)
@@ -1713,8 +1605,3 @@ void VulkanUpsampler::resetAdaptiveTarget()
     printf("[+] Adaptive target reset requested (re-calibration)\n");
 }
 
-void VulkanUpsampler::setRatioAdjustmentRange(float range)
-{
-    // No-op: ratio adjustment is disabled
-    (void)range;
-}

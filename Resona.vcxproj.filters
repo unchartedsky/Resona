@@ -27,12 +27,18 @@
     <ClCompile Include="VulkanUpsampler.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="RenderPipeline\SubmissionPlanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="miniaudio.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="VulkanUpsampler.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="RenderPipeline\SubmissionPlanner.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

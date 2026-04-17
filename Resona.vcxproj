@@ -136,10 +136,12 @@
   <ItemGroup>
     <ClCompile Include="GpuUpsampler.h" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="RenderPipeline\SubmissionPlanner.cpp" />
     <ClCompile Include="VulkanUpsampler.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="miniaudio.h" />
+    <ClInclude Include="RenderPipeline\SubmissionPlanner.h" />
     <ClInclude Include="VulkanUpsampler.h" />
   </ItemGroup>
   <ItemGroup>

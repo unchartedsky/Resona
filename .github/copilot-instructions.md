@@ -1,11 +1,14 @@
 # Copilot Instructions
 
 ## Project Guidelines
-- User prefers a workflow where they manually handle rollbacks; after rollback they want root-cause investigation rather than automatic rollback actions.
-- The project targets Windows, Linux, Android, iOS, and macOS. The planned direction is to keep input/output code robust and evolve the upsampler toward a sound rendering engine. This includes documenting the project's forward-looking architecture direction in an AGENTS.md file.
+- Target Windows, Linux, Android, iOS, and macOS.
+- Prefer a workflow where the user manually handles rollbacks; after rollback, perform root-cause investigation rather than initiating automatic rollback actions.
+- Evolve architecture: treat VulkanUpsampler as one renderer path; design the system to support composing AI models and multiple renderer backends into the render pipeline and to progress the upsampler toward a sound rendering engine.
+- Add a simple UI to display input/output source information and allow users to configure filter combinations and settings.
+- Document the forward-looking architecture and renderer composition strategy in AGENTS.md.
 
 ## Documentation Requirements
-- README documentation must include explicit checks for Vulkan version and miniaudio version.
+- Include explicit checks for Vulkan version and miniaudio version in README documentation.
 
 ## Maintenance
 - Remove completed, already-applied items from Copilot instruction files to keep them current.

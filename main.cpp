@@ -347,6 +347,28 @@ class GpuProcessingThread
 
 static GpuProcessingThread g_gpuProcessor;
 
+static void waitForOutputPrebuffer()
+{
+    // Add 5% safety margin to prevent initial underrun
+    const uint32_t targetFrames = AudioConfig::PREBUFFER_FRAMES;
+    const uint32_t safetyMargin = targetFrames / 20; // 5% margin
+    const uint32_t safeTargetFrames = targetFrames + safetyMargin;
+
+    printf("[*] Waiting for prebuffer (target: %u frames + %u margin)...\n", targetFrames, safetyMargin);
+
+    while (g_outputRing.available() / AudioConfig::CHANNELS < safeTargetFrames)
+    {
+        const uint32_t currentFrames = g_outputRing.available() / AudioConfig::CHANNELS;
+        printf("    Progress: %u/%u frames (%.1f%%)     \r", currentFrames, safeTargetFrames,
+               (currentFrames * 100.0f) / safeTargetFrames);
+        fflush(stdout);
+        ma_sleep(AudioConfig::SLEEP_INTERVAL_MS);
+    }
+
+    printf("\n[+] Prebuffer complete (filled: %u frames)                    \n",
+           g_outputRing.available() / AudioConfig::CHANNELS);
+}
+
 // === Signal Handler ===
 void signal_handler(int signal)
 {
@@ -480,21 +502,50 @@ class AudioDeviceManager
             return false;
         }
 
-        // Start capture device first
+        // Start capture and playback together
         if (ma_device_start(&captureDevice) != MA_SUCCESS)
         {
             printf("[!] Failed to start capture device\n");
             return false;
         }
 
-        // Wait for initial buffer fill
-        waitForPrebuffer();
-
-        // Start playback device after prebuffering
+        // Start playback device
         if (ma_device_start(&playbackDevice) != MA_SUCCESS)
         {
             printf("[!] Failed to start playback device\n");
             ma_device_stop(&captureDevice);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool startCapture()
+    {
+        if (!captureInitialized)
+        {
+            return false;
+        }
+
+        if (ma_device_start(&captureDevice) != MA_SUCCESS)
+        {
+            printf("[!] Failed to start capture device\n");
+            return false;
+        }
+
+        return true;
+    }
+
+    bool startPlayback()
+    {
+        if (!playbackInitialized)
+        {
+            return false;
+        }
+
+        if (ma_device_start(&playbackDevice) != MA_SUCCESS)
+        {
+            printf("[!] Failed to start playback device\n");
             return false;
         }
 
@@ -509,7 +560,6 @@ class AudioDeviceManager
         }
 
         ma_device_stop(&playbackDevice);
-        waitForPrebuffer();
 
         return ma_device_start(&playbackDevice) == MA_SUCCESS;
     }
@@ -555,27 +605,6 @@ class AudioDeviceManager
         }
     }
 
-    void waitForPrebuffer()
-    {
-        // Add 5% safety margin to prevent initial underrun
-        const uint32_t targetFrames = AudioConfig::PREBUFFER_FRAMES;
-        const uint32_t safetyMargin = targetFrames / 20; // 5% margin
-        const uint32_t safeTargetFrames = targetFrames + safetyMargin;
-
-        printf("[*] Waiting for prebuffer (target: %u frames + %u margin)...\n", targetFrames, safetyMargin);
-
-        while (g_outputRing.available() / AudioConfig::CHANNELS < safeTargetFrames)
-        {
-            const uint32_t currentFrames = g_outputRing.available() / AudioConfig::CHANNELS;
-            printf("    Progress: %u/%u frames (%.1f%%)     \r", currentFrames, safeTargetFrames,
-                   (currentFrames * 100.0f) / safeTargetFrames);
-            fflush(stdout);
-            ma_sleep(AudioConfig::SLEEP_INTERVAL_MS);
-        }
-
-        printf("\n[+] Prebuffer complete (filled: %u frames)                    \n",
-               g_outputRing.available() / AudioConfig::CHANNELS);
-    }
 };
 
 // === Improved Audio Callbacks ===
@@ -802,15 +831,26 @@ int main()
         return EXIT_FAILURE;
     }
 
-    // Step 7: Start devices
-    if (!deviceManager.startDevices())
+    // Step 7: Start capture first so input/output generation can begin
+    if (!deviceManager.startCapture())
     {
         g_gpuReady.store(false, std::memory_order_release);
         g_gpuProcessor.stop();
         return EXIT_FAILURE;
     }
 
-    // Step 8: Reset adaptive target now that prebuffer is complete and stable
+    // Step 8: Wait for output prebuffer before enabling playback
+    waitForOutputPrebuffer();
+
+    if (!deviceManager.startPlayback())
+    {
+        g_gpuReady.store(false, std::memory_order_release);
+        g_gpuProcessor.stop();
+        deviceManager.stopDevices();
+        return EXIT_FAILURE;
+    }
+
+    // Step 9: Reset adaptive target now that prebuffer is complete and stable
     // This ensures we capture the full buffer level (e.g. 15%) as the target, not the initial empty state
     if (g_upsampler)
     {

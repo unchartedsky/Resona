@@ -2,6 +2,68 @@
 
 #include <algorithm>
 
+namespace
+{
+struct SubmissionRule
+{
+    float maxBufferRatio;
+    uint32_t minAvailableSlots;
+    uint32_t targetBatches;
+};
+
+struct SleepRule
+{
+    float maxBufferRatio;
+    uint32_t sleepMs;
+};
+
+uint32_t ComputeBatchesToSubmit(const SubmissionInputs &inputs, float bufferRatio)
+{
+    const SubmissionRule resolvedRules[] = {
+        {inputs.submitCriticalThreshold, 4u, inputs.maxSubmittedBatches},
+        {inputs.submitLowThreshold, 3u, 3u},
+        {1.0f, 2u, 2u},
+    };
+
+    uint32_t batchesToSubmit = 1;
+    for (const SubmissionRule &rule : resolvedRules)
+    {
+        if (bufferRatio < rule.maxBufferRatio && inputs.availableSlots >= rule.minAvailableSlots)
+        {
+            batchesToSubmit = std::min(inputs.availableSlots, rule.targetBatches);
+            break;
+        }
+    }
+
+    const uint32_t totalRequiredFrames = inputs.batchFrames * batchesToSubmit;
+    if (inputs.availableInputFrames < totalRequiredFrames)
+    {
+        batchesToSubmit = std::max(1u, inputs.availableInputFrames / inputs.batchFrames);
+    }
+
+    return batchesToSubmit;
+}
+
+uint32_t ComputeSleepMs(const SubmissionInputs &inputs, float bufferRatio)
+{
+    const SleepRule rules[] = {
+        {inputs.sleepCriticalThreshold, 0u},
+        {inputs.sleepLowThreshold, 1u},
+        {2.0f, inputs.idleSleepMs},
+    };
+
+    for (const SleepRule &rule : rules)
+    {
+        if (bufferRatio < rule.maxBufferRatio)
+        {
+            return rule.sleepMs;
+        }
+    }
+
+    return inputs.idleSleepMs;
+}
+} // namespace
+
 SubmissionPlan SubmissionPlanner::Build(const SubmissionInputs &inputs)
 {
     SubmissionPlan plan{};
@@ -19,25 +81,7 @@ SubmissionPlan SubmissionPlanner::Build(const SubmissionInputs &inputs)
         plan.bufferRatio = static_cast<float>(inputs.outputBufferFrames) / plan.targetBufferFrames;
     }
 
-    uint32_t batchesToSubmit = 1;
-    if (plan.bufferRatio < inputs.submitCriticalThreshold && inputs.availableSlots > 3)
-    {
-        batchesToSubmit = std::min(inputs.availableSlots, inputs.maxSubmittedBatches);
-    }
-    else if (plan.bufferRatio < inputs.submitLowThreshold && inputs.availableSlots > 2)
-    {
-        batchesToSubmit = std::min(inputs.availableSlots, 3u);
-    }
-    else if (inputs.availableSlots > 1)
-    {
-        batchesToSubmit = std::min(inputs.availableSlots, 2u);
-    }
-
-    const uint32_t totalRequiredFrames = inputs.batchFrames * batchesToSubmit;
-    if (inputs.availableInputFrames < totalRequiredFrames)
-    {
-        batchesToSubmit = std::max(1u, inputs.availableInputFrames / inputs.batchFrames);
-    }
+    const uint32_t batchesToSubmit = ComputeBatchesToSubmit(inputs, plan.bufferRatio);
 
     if (batchesToSubmit == 0)
     {
@@ -57,19 +101,7 @@ SubmissionPlan SubmissionPlanner::Build(const SubmissionInputs &inputs)
 
     plan.batchesToSubmit = batchesToSubmit;
     plan.shouldSubmit = true;
-
-    if (plan.bufferRatio < inputs.sleepCriticalThreshold)
-    {
-        plan.sleepMs = 0;
-    }
-    else if (plan.bufferRatio < inputs.sleepLowThreshold)
-    {
-        plan.sleepMs = 1;
-    }
-    else
-    {
-        plan.sleepMs = inputs.idleSleepMs;
-    }
+    plan.sleepMs = ComputeSleepMs(inputs, plan.bufferRatio);
 
     return plan;
 }

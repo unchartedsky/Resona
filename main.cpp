@@ -28,6 +28,7 @@
 #include "miniaudio.h"
 
 #include "Audio/AudioDeviceManager.h"
+#include "Audio/FloatRingBuffer.h"
 #include "GpuUpsampler.h"
 #include "RenderPipeline/SubmissionPlanner.h"
 #include "VulkanUpsampler.h"
@@ -76,132 +77,6 @@ std::atomic<uint64_t> g_processedOutputFrames{0}; // Track total output frames a
 std::atomic<uint64_t> g_playedOutputFrames{0};    // Track total output frames played
 
 static std::unique_ptr<GpuUpsampler> g_upsampler;
-
-// === Improved Ring Buffer ===
-class FloatRingBuffer
-{
-  public:
-    void init(uint32_t totalSamples)
-    {
-        buffer.resize(totalSamples);
-        size = totalSamples;
-
-        // Check if size is power of 2 for optimal performance
-        const bool isPowerOf2 = (size & (size - 1)) == 0;
-        if (!isPowerOf2)
-        {
-            printf("[!] Warning: Ring buffer size is not power of 2, performance may be suboptimal\n");
-        }
-        else
-        {
-            // For power-of-2 sizes, we can use fast bitwise AND instead of modulo
-            sizeMask = size - 1;
-            useFastModulo = true;
-            printf("[+] Ring buffer using fast power-of-2 modulo optimization\n");
-        }
-
-        printf("[+] Ring buffer initialized: %u samples (%.1f KB)\n", size, (size * sizeof(float)) / 1024.0f);
-    }
-
-    void push(const float *data, uint32_t count) noexcept
-    {
-        if (count > size) [[unlikely]]
-        {
-            printf("[!] Push count exceeds buffer size\n");
-            return;
-        }
-
-        const uint32_t writeIdx = writePos.load(std::memory_order_relaxed);
-
-        // OPTIMIZED: Use fast bitwise AND for power-of-2 sizes
-        const uint32_t writeOffset = useFastModulo ? (writeIdx & sizeMask) : (writeIdx % size);
-
-        // Prefetch next cache line for better performance
-        if (count > 64)
-        { // Only for larger transfers
-            PREFETCH_WRITE(&buffer[writeOffset]);
-        }
-
-        // Check if we can copy to contiguous memory region
-        const uint32_t endSpace = size - writeOffset;
-        if (count <= endSpace)
-        {
-            // Single contiguous copy
-            std::memcpy(&buffer[writeOffset], data, count * sizeof(float));
-        }
-        else
-        {
-            // Split copy across buffer boundary
-            std::memcpy(&buffer[writeOffset], data, endSpace * sizeof(float));
-            std::memcpy(&buffer[0], data + endSpace, (count - endSpace) * sizeof(float));
-        }
-
-        writePos.store(writeIdx + count, std::memory_order_release);
-    }
-
-    uint32_t pop(float *out, uint32_t count) noexcept
-    {
-        const uint32_t readIdx = readPos.load(std::memory_order_relaxed);
-        const uint32_t writeIdx = writePos.load(std::memory_order_acquire);
-        const uint32_t available = writeIdx - readIdx;
-        const uint32_t toRead = std::min(count, available);
-
-        if (toRead == 0) [[unlikely]]
-        {
-            return 0;
-        }
-
-        // OPTIMIZED: Use fast bitwise AND for power-of-2 sizes
-        const uint32_t readOffset = useFastModulo ? (readIdx & sizeMask) : (readIdx % size);
-
-        // Prefetch next cache line for better performance
-        if (toRead > 64)
-        { // Only for larger transfers
-            PREFETCH_READ(&buffer[readOffset]);
-        }
-
-        // Check if we can copy from contiguous memory region
-        const uint32_t endSpace = size - readOffset;
-        if (toRead <= endSpace)
-        {
-            // Single contiguous copy
-            std::memcpy(out, &buffer[readOffset], toRead * sizeof(float));
-        }
-        else
-        {
-            // Split copy across buffer boundary
-            std::memcpy(out, &buffer[readOffset], endSpace * sizeof(float));
-            std::memcpy(out + endSpace, &buffer[0], (toRead - endSpace) * sizeof(float));
-        }
-
-        readPos.store(readIdx + toRead, std::memory_order_release);
-        return toRead;
-    }
-
-    uint32_t available() const noexcept
-    {
-        return writePos.load(std::memory_order_acquire) - readPos.load(std::memory_order_relaxed);
-    }
-
-  private:
-    std::vector<float> buffer;
-
-    // Cache-line aligned atomics to prevent false sharing
-    // Warning C4324: structure was padded due to alignment specifier - this is intentional
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4324)
-#endif
-    alignas(64) std::atomic<uint32_t> writePos{0};
-    alignas(64) std::atomic<uint32_t> readPos{0};
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
-
-    uint32_t size{0};
-    uint32_t sizeMask{0}; // For fast power-of-2 modulo (size - 1)
-    bool useFastModulo{false};
-};
 
 // === Dual Ring Buffers ===
 static FloatRingBuffer g_inputRing;  // 44.1kHz captured audio

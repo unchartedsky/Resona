@@ -142,6 +142,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Audio\AudioDeviceManager.h" />
+    <ClInclude Include="Audio\FloatRingBuffer.h" />
     <ClInclude Include="miniaudio.h" />
     <ClInclude Include="RenderPipeline\SubmissionPlanner.h" />
     <ClInclude Include="VulkanUpsampler.h" />

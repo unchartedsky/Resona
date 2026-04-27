@@ -28,6 +28,7 @@
 #include "miniaudio.h"
 
 #include "Audio/AudioDeviceManager.h"
+#include "Audio/AudioCallbackContext.h"
 #include "Audio/FloatRingBuffer.h"
 #include "GpuUpsampler.h"
 #include "RenderPipeline/SubmissionPlanner.h"
@@ -255,70 +256,6 @@ void signal_handler(int signal)
     }
 }
 
-// === Improved Audio Callbacks ===
-void AudioDeviceManager::capture_callback(ma_device *device, void *output, const void *input, ma_uint32 frameCount)
-{
-    (void)output;
-    (void)device;
-
-    // Early exit checks
-    if (!g_running.load(std::memory_order_acquire))
-    {
-        return;
-    }
-
-    if (!input) [[unlikely]]
-    {
-        return;
-    }
-
-    const auto *inputSamples = static_cast<const float *>(input);
-    const uint32_t samples = frameCount * AudioConfig::CHANNELS;
-
-    // FAST PATH: Just push to input ring buffer (no GPU processing here)
-    g_inputRing.push(inputSamples, samples);
-
-    // Track captured frames
-    g_capturedInputFrames.fetch_add(frameCount, std::memory_order_relaxed);
-}
-
-void AudioDeviceManager::playback_callback(ma_device *device, void *output, const void *input, ma_uint32 frameCount)
-{
-    (void)input;
-    (void)device;
-
-    // Check if we're shutting down
-    if (!g_running.load(std::memory_order_acquire))
-    {
-        auto *outputSamples = static_cast<float *>(output);
-        const uint32_t requiredSamples = frameCount * AudioConfig::CHANNELS;
-        std::memset(outputSamples, 0, requiredSamples * sizeof(float));
-        return;
-    }
-
-    auto *outputSamples = static_cast<float *>(output);
-    const uint32_t requiredSamples = frameCount * AudioConfig::CHANNELS;
-
-    const uint32_t actualSamples = g_outputRing.pop(outputSamples, requiredSamples);
-
-    if (actualSamples < requiredSamples) [[unlikely]]
-    {
-        // Zero-fill remaining samples
-        const size_t remainingBytes = (requiredSamples - actualSamples) * sizeof(float);
-        std::memset(outputSamples + actualSamples, 0, remainingBytes);
-
-        // Only trigger underrun if buffer is critically low
-        const uint32_t remainingFrames = g_outputRing.available() / AudioConfig::CHANNELS;
-        if (remainingFrames < AudioConfig::MIN_BUFFER_FRAMES)
-        {
-            g_underrun.store(true, std::memory_order_relaxed);
-        }
-    }
-
-    // Track played frames
-    g_playedOutputFrames.fetch_add(frameCount, std::memory_order_relaxed);
-}
-
 // === Main Processing Loop ===
 void runMainLoop(AudioDeviceManager &deviceManager)
 {
@@ -471,7 +408,17 @@ int main()
     printf("[*] Initializing audio devices...\n");
 
     // Step 6: Initialize audio devices
-    AudioDeviceManager deviceManager;
+    AudioCallbackContext audioCallbackContext{};
+    audioCallbackContext.running = &g_running;
+    audioCallbackContext.underrun = &g_underrun;
+    audioCallbackContext.inputRing = &g_inputRing;
+    audioCallbackContext.outputRing = &g_outputRing;
+    audioCallbackContext.capturedInputFrames = &g_capturedInputFrames;
+    audioCallbackContext.playedOutputFrames = &g_playedOutputFrames;
+    audioCallbackContext.channels = AudioConfig::CHANNELS;
+    audioCallbackContext.minBufferFrames = AudioConfig::MIN_BUFFER_FRAMES;
+
+    AudioDeviceManager deviceManager(&audioCallbackContext);
     if (!deviceManager.initializeCapture() || !deviceManager.initializePlayback())
     {
         g_gpuReady.store(false, std::memory_order_release);

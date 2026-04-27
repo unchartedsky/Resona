@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 
 #ifdef _WIN32
@@ -15,6 +16,11 @@ constexpr uint32_t kOutputSampleRate = 384000;
 constexpr uint32_t kChannels = 2;
 } // namespace
 
+AudioDeviceManager::AudioDeviceManager(AudioCallbackContext *callbackContext)
+    : callbackContext(callbackContext)
+{
+}
+
 AudioDeviceManager::~AudioDeviceManager()
 {
     cleanup();
@@ -27,6 +33,7 @@ bool AudioDeviceManager::initializeCapture()
     config.capture.format = ma_format_f32;
     config.capture.channels = kChannels;
     config.dataCallback = capture_callback;
+    config.pUserData = callbackContext;
 
     config.noPreSilencedOutputBuffer = MA_TRUE;
     config.noClip = MA_TRUE;
@@ -82,6 +89,7 @@ bool AudioDeviceManager::initializePlayback()
     config.playback.format = ma_format_f32;
     config.playback.channels = kChannels;
     config.dataCallback = playback_callback;
+    config.pUserData = callbackContext;
 
     config.noPreSilencedOutputBuffer = MA_TRUE;
     config.noClip = MA_TRUE;
@@ -203,4 +211,67 @@ void AudioDeviceManager::cleanup()
     {
         ma_device_uninit(&playbackDevice);
     }
+}
+
+void AudioDeviceManager::capture_callback(ma_device *device, void *output, const void *input, ma_uint32 frameCount)
+{
+    (void)output;
+
+    auto *context = static_cast<AudioCallbackContext *>(device->pUserData);
+    if (!context || !context->running || !context->inputRing || !context->capturedInputFrames)
+    {
+        return;
+    }
+
+    if (!context->running->load(std::memory_order_acquire))
+    {
+        return;
+    }
+
+    if (!input) [[unlikely]]
+    {
+        return;
+    }
+
+    const auto *inputSamples = static_cast<const float *>(input);
+    const uint32_t samples = frameCount * context->channels;
+
+    context->inputRing->push(inputSamples, samples);
+    context->capturedInputFrames->fetch_add(frameCount, std::memory_order_relaxed);
+}
+
+void AudioDeviceManager::playback_callback(ma_device *device, void *output, const void *input, ma_uint32 frameCount)
+{
+    (void)input;
+
+    auto *context = static_cast<AudioCallbackContext *>(device->pUserData);
+    if (!context || !context->running || !context->outputRing || !context->playedOutputFrames)
+    {
+        return;
+    }
+
+    auto *outputSamples = static_cast<float *>(output);
+    const uint32_t requiredSamples = frameCount * context->channels;
+
+    if (!context->running->load(std::memory_order_acquire))
+    {
+        std::memset(outputSamples, 0, requiredSamples * sizeof(float));
+        return;
+    }
+
+    const uint32_t actualSamples = context->outputRing->pop(outputSamples, requiredSamples);
+
+    if (actualSamples < requiredSamples) [[unlikely]]
+    {
+        const size_t remainingBytes = (requiredSamples - actualSamples) * sizeof(float);
+        std::memset(outputSamples + actualSamples, 0, remainingBytes);
+
+        const uint32_t remainingFrames = context->outputRing->available() / context->channels;
+        if (context->underrun && remainingFrames < context->minBufferFrames)
+        {
+            context->underrun->store(true, std::memory_order_relaxed);
+        }
+    }
+
+    context->playedOutputFrames->fetch_add(frameCount, std::memory_order_relaxed);
 }

@@ -50,6 +50,9 @@
     <ClInclude Include="Audio\FloatRingBuffer.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="Audio\AudioCallbackContext.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <None Include="linear.comp">

@@ -31,7 +31,7 @@
 #include "Audio/AudioCallbackContext.h"
 #include "Audio/FloatRingBuffer.h"
 #include "GpuUpsampler.h"
-#include "RenderPipeline/SubmissionPlanner.h"
+#include "RenderPipeline/GpuProcessingThread.h"
 #include "VulkanUpsampler.h"
 
 // === Configuration Constants ===
@@ -83,146 +83,8 @@ static std::unique_ptr<GpuUpsampler> g_upsampler;
 static FloatRingBuffer g_inputRing;  // 44.1kHz captured audio
 static FloatRingBuffer g_outputRing; // 384kHz upsampled audio
 
-// === GPU Processing Thread ===
-class GpuProcessingThread
-{
-  public:
-    void start()
-    {
-        if (running)
-            return;
-
-        running = true;
-        thread = std::thread([this]() {
-// Set high priority for GPU processing thread
-#ifdef _WIN32
-            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-#endif
-
-            printf("[+] GPU processing thread started (adaptive mode)\n");
-
-            // Reusable buffer (will grow as needed)
-            std::vector<float> inputBuffer;
-
-            while (running)
-            {
-                if (!g_gpuReady.load(std::memory_order_acquire) || !g_upsampler)
-                {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    continue;
-                }
-
-                auto *vulkanUpsampler = static_cast<VulkanUpsampler *>(g_upsampler.get());
-
-                const uint32_t outputBufferFrames = g_outputRing.available() / AudioConfig::CHANNELS;
-                const uint32_t batchFrames = VulkanUpsampler::AdaptivePolicy::FixedBatchFrames;
-                const uint32_t batchSamples = batchFrames * AudioConfig::CHANNELS;
-                const uint32_t availableInputFrames = g_inputRing.available() / AudioConfig::CHANNELS;
-                const size_t availableSlots = vulkanUpsampler->getAvailableSlots();
-                const float ratio =
-                    static_cast<float>(AudioConfig::OUTPUT_SAMPLE_RATE) / AudioConfig::INPUT_SAMPLE_RATE;
-                const uint32_t expectedOutputFramesPerBatch = static_cast<uint32_t>(batchFrames * ratio);
-
-                SubmissionInputs plannerInputs{};
-                plannerInputs.outputBufferFrames = outputBufferFrames;
-                plannerInputs.outputRingCapacityFrames = AudioConfig::OUTPUT_RING_BUFFER_FRAMES;
-                plannerInputs.availableInputFrames = availableInputFrames;
-                plannerInputs.availableSlots = static_cast<uint32_t>(availableSlots);
-                plannerInputs.batchFrames = batchFrames;
-                plannerInputs.expectedOutputFramesPerBatch = expectedOutputFramesPerBatch;
-                plannerInputs.idleSleepMs = AudioConfig::GPU_THREAD_SLEEP_MS;
-                plannerInputs.targetBufferPercent = VulkanUpsampler::AdaptivePolicy::TargetBufferPercent;
-                plannerInputs.maxSubmittedBatches = VulkanUpsampler::AdaptivePolicy::MaxSubmittedBatches;
-                plannerInputs.submitCriticalThreshold = VulkanUpsampler::AdaptivePolicy::SubmitCriticalThreshold;
-                plannerInputs.submitLowThreshold = VulkanUpsampler::AdaptivePolicy::SubmitLowThreshold;
-                plannerInputs.sleepCriticalThreshold = VulkanUpsampler::AdaptivePolicy::SleepCriticalThreshold;
-                plannerInputs.sleepLowThreshold = VulkanUpsampler::AdaptivePolicy::SleepLowThreshold;
-
-                const SubmissionPlan plan = SubmissionPlanner::Build(plannerInputs);
-
-                vulkanUpsampler->updateAdaptiveParams(outputBufferFrames, plan.targetBufferFrames);
-
-                if (!plan.shouldSubmit)
-                {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(AudioConfig::GPU_THREAD_SLEEP_MS));
-                    continue;
-                }
-
-                // Resize input buffer if needed
-                const uint32_t maxBatchSamples = batchSamples * plan.batchesToSubmit;
-                if (inputBuffer.size() < maxBatchSamples)
-                {
-                    inputBuffer.resize(maxBatchSamples);
-                }
-
-                // Submit multiple batches
-                for (uint32_t i = 0; i < plan.batchesToSubmit; ++i)
-                {
-                    // Read input data from input ring buffer
-                    const uint32_t readSamples = g_inputRing.pop(inputBuffer.data() + (i * batchSamples), batchSamples);
-                    const uint32_t readFrames = readSamples / AudioConfig::CHANNELS;
-
-                    if (readFrames == 0)
-                    {
-                        break;
-                    }
-
-                    // Submit to GPU for processing (async)
-                    uint64_t sequenceId = vulkanUpsampler->processAsync(
-                        inputBuffer.data() + (i * batchSamples), readFrames,
-                        [readFrames = readFrames](const float *output, uint32_t outputFrames) {
-                            // Callback executes when GPU work completes
-                            const uint32_t outputSamples = outputFrames * AudioConfig::CHANNELS;
-                            g_outputRing.push(output, outputSamples);
-
-                            // Track processing statistics
-                            g_processedInputFrames.fetch_add(readFrames, std::memory_order_relaxed);
-                            g_processedOutputFrames.fetch_add(outputFrames, std::memory_order_relaxed);
-                        });
-
-                    if (sequenceId == 0)
-                    {
-                        // Failed to submit - GPU slots busy, stop trying
-                        break;
-                    }
-                }
-
-                // Poll for completed work (non-blocking)
-                vulkanUpsampler->tryPollAll();
-
-                if (plan.sleepMs > 0)
-                {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(plan.sleepMs));
-                }
-            }
-
-            printf("[+] GPU processing thread stopped\n");
-        });
-    }
-
-    void stop()
-    {
-        if (!running)
-            return;
-
-        running = false;
-        if (thread.joinable())
-        {
-            thread.join();
-        }
-    }
-
-    ~GpuProcessingThread()
-    {
-        stop();
-    }
-
-  private:
-    std::atomic<bool> running{false};
-    std::thread thread;
-};
-
-static GpuProcessingThread g_gpuProcessor;
+static GpuProcessingContext g_gpuProcessingContext;
+static GpuProcessingThread g_gpuProcessor(&g_gpuProcessingContext);
 
 static void waitForOutputPrebuffer()
 {
@@ -399,6 +261,18 @@ int main()
     g_outputRing.init(AudioConfig::OUTPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS);
 
     // Step 4: Mark GPU as ready
+    g_gpuProcessingContext.gpuReady = &g_gpuReady;
+    g_gpuProcessingContext.upsampler = static_cast<VulkanUpsampler *>(g_upsampler.get());
+    g_gpuProcessingContext.inputRing = &g_inputRing;
+    g_gpuProcessingContext.outputRing = &g_outputRing;
+    g_gpuProcessingContext.processedInputFrames = &g_processedInputFrames;
+    g_gpuProcessingContext.processedOutputFrames = &g_processedOutputFrames;
+    g_gpuProcessingContext.inputSampleRate = AudioConfig::INPUT_SAMPLE_RATE;
+    g_gpuProcessingContext.outputSampleRate = AudioConfig::OUTPUT_SAMPLE_RATE;
+    g_gpuProcessingContext.channels = AudioConfig::CHANNELS;
+    g_gpuProcessingContext.outputRingCapacityFrames = AudioConfig::OUTPUT_RING_BUFFER_FRAMES;
+    g_gpuProcessingContext.idleSleepMs = AudioConfig::GPU_THREAD_SLEEP_MS;
+
     g_gpuReady.store(true, std::memory_order_release);
 
     // Step 5: Start GPU processing thread

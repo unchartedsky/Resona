@@ -137,6 +137,7 @@
     <ClCompile Include="Audio\AudioDeviceManager.cpp" />
     <ClCompile Include="GpuUpsampler.h" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="RenderPipeline\GpuProcessingThread.cpp" />
     <ClCompile Include="RenderPipeline\SubmissionPlanner.cpp" />
     <ClCompile Include="VulkanUpsampler.cpp" />
   </ItemGroup>
@@ -145,6 +146,7 @@
     <ClInclude Include="Audio\AudioDeviceManager.h" />
     <ClInclude Include="Audio\FloatRingBuffer.h" />
     <ClInclude Include="miniaudio.h" />
+    <ClInclude Include="RenderPipeline\GpuProcessingThread.h" />
     <ClInclude Include="RenderPipeline\SubmissionPlanner.h" />
     <ClInclude Include="VulkanUpsampler.h" />
   </ItemGroup>

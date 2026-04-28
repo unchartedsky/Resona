@@ -33,6 +33,7 @@
 #include "GpuUpsampler.h"
 #include "RenderPipeline/GpuProcessingThread.h"
 #include "VulkanUpsampler.h"
+#include "Runtime/StatusReporter.h"
 
 // === Configuration Constants ===
 namespace AudioConfig
@@ -186,22 +187,23 @@ void runMainLoop(AudioDeviceManager &deviceManager)
                 bufferPressure = std::min(1.0f, static_cast<float>(outputBufferFrames) / targetBufferFrames);
             }
 
-            // Calculate ratio deviation from base
             const float baseRatio = static_cast<float>(AudioConfig::OUTPUT_SAMPLE_RATE) /
                                     static_cast<float>(AudioConfig::INPUT_SAMPLE_RATE);
-            const float ratioDeviation = ((currentRatio / baseRatio) - 1.0f) * 100.0f; // Percentage
 
             // Calculate total runtime
             auto totalElapsed = std::chrono::duration_cast<std::chrono::seconds>(now - startTime).count();
 
-            // SIMPLIFIED: Single-line compact status
-            printf("\r\033[K"); // Clear line
-            printf("Out:%u(%.0f%%%+.0f) GPU:%u/%u Ratio:%.6f(%+.3f%%) Target:%.0f%% %llus", outputBufferFrames,
-                   (outputBufferFrames * 100.0f) / AudioConfig::OUTPUT_RING_BUFFER_FRAMES, outputFillRate,
-                   static_cast<uint32_t>(VulkanUpsampler::NUM_SLOTS - availableSlots),
-                   static_cast<uint32_t>(VulkanUpsampler::NUM_SLOTS), currentRatio, ratioDeviation,
-                   bufferPressure * 100.0f, static_cast<unsigned long long>(totalElapsed));
-            fflush(stdout);
+            RuntimeStatusSnapshot statusSnapshot{};
+            statusSnapshot.outputBufferFrames = outputBufferFrames;
+            statusSnapshot.outputFillRate = outputFillRate;
+            statusSnapshot.busySlots = static_cast<uint32_t>(VulkanUpsampler::NUM_SLOTS - availableSlots);
+            statusSnapshot.totalSlots = static_cast<uint32_t>(VulkanUpsampler::NUM_SLOTS);
+            statusSnapshot.currentRatio = currentRatio;
+            statusSnapshot.baseRatio = baseRatio;
+            statusSnapshot.targetFillRatio = bufferPressure;
+            statusSnapshot.outputRingCapacityFrames = AudioConfig::OUTPUT_RING_BUFFER_FRAMES;
+            statusSnapshot.totalElapsedSeconds = totalElapsed;
+            StatusReporter::PrintStatusLine(statusSnapshot);
 
             lastInputBufferLevel = inputBufferFrames;
             lastOutputBufferLevel = outputBufferFrames;
@@ -220,17 +222,12 @@ void runMainLoop(AudioDeviceManager &deviceManager)
     const uint64_t totalProcessed = g_processedInputFrames.load(std::memory_order_relaxed);
     const uint64_t totalPlayed = g_playedOutputFrames.load(std::memory_order_relaxed);
 
-    if (totalElapsed > 0)
-    {
-        printf("[+] Session statistics:\n");
-        printf("    Runtime: %lld seconds\n", static_cast<long long>(totalElapsed));
-        printf("    Input captured: %llu frames (%.1f fps avg)\n", totalCaptured,
-               totalCaptured / static_cast<double>(totalElapsed));
-        printf("    Input processed: %llu frames (%.1f fps avg)\n", totalProcessed,
-               totalProcessed / static_cast<double>(totalElapsed));
-        printf("    Output played: %llu frames (%.1f fps avg)\n", totalPlayed,
-               totalPlayed / static_cast<double>(totalElapsed));
-    }
+    SessionStatistics sessionStatistics{};
+    sessionStatistics.totalElapsedSeconds = totalElapsed;
+    sessionStatistics.totalCapturedFrames = totalCaptured;
+    sessionStatistics.totalProcessedFrames = totalProcessed;
+    sessionStatistics.totalPlayedFrames = totalPlayed;
+    StatusReporter::PrintSessionStatistics(sessionStatistics);
 }
 
 // === Main Application ===

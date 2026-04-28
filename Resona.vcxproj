@@ -139,6 +139,7 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="RenderPipeline\GpuProcessingThread.cpp" />
     <ClCompile Include="RenderPipeline\SubmissionPlanner.cpp" />
+    <ClCompile Include="Runtime\StatusReporter.cpp" />
     <ClCompile Include="VulkanUpsampler.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -148,6 +149,7 @@
     <ClInclude Include="miniaudio.h" />
     <ClInclude Include="RenderPipeline\GpuProcessingThread.h" />
     <ClInclude Include="RenderPipeline\SubmissionPlanner.h" />
+    <ClInclude Include="Runtime\StatusReporter.h" />
     <ClInclude Include="VulkanUpsampler.h" />
   </ItemGroup>
   <ItemGroup>

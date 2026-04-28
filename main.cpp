@@ -170,7 +170,6 @@ void runMainLoop(AudioDeviceManager &deviceManager)
 
             const auto *vulkanUpsampler = static_cast<VulkanUpsampler *>(g_upsampler.get());
             const size_t availableSlots = vulkanUpsampler->getAvailableSlots();
-            const uint32_t batchSize = VulkanUpsampler::AdaptivePolicy::FixedBatchFrames;
             const float currentRatio = vulkanUpsampler->getCurrentRatio();
 
             // Calculate buffer fill rates (frames per second)
@@ -178,7 +177,7 @@ void runMainLoop(AudioDeviceManager &deviceManager)
                 static_cast<int32_t>(outputBufferFrames) - static_cast<int32_t>(lastOutputBufferLevel);
             const double outputFillRate = (outputBufferDelta * 1000.0) / elapsedMs;
 
-            // Calculate buffer pressure (based on dynamic target level)
+            // Calculate buffer pressure against the current adaptive target level.
             const uint32_t targetBufferFrames = vulkanUpsampler->getTargetBufferLevel();
             float bufferPressure = 1.0f;
 
@@ -197,10 +196,10 @@ void runMainLoop(AudioDeviceManager &deviceManager)
 
             // SIMPLIFIED: Single-line compact status
             printf("\r\033[K"); // Clear line
-            printf("Out:%u(%.0f%%%+.0f) GPU:%u/%u Batch:%u Ratio:%.6f(%+.3f%%) Press:%.0f%% %llus", outputBufferFrames,
+            printf("Out:%u(%.0f%%%+.0f) GPU:%u/%u Ratio:%.6f(%+.3f%%) Target:%.0f%% %llus", outputBufferFrames,
                    (outputBufferFrames * 100.0f) / AudioConfig::OUTPUT_RING_BUFFER_FRAMES, outputFillRate,
                    static_cast<uint32_t>(VulkanUpsampler::NUM_SLOTS - availableSlots),
-                   static_cast<uint32_t>(VulkanUpsampler::NUM_SLOTS), batchSize, currentRatio, ratioDeviation,
+                   static_cast<uint32_t>(VulkanUpsampler::NUM_SLOTS), currentRatio, ratioDeviation,
                    bufferPressure * 100.0f, static_cast<unsigned long long>(totalElapsed));
             fflush(stdout);
 
@@ -225,14 +224,12 @@ void runMainLoop(AudioDeviceManager &deviceManager)
     {
         printf("[+] Session statistics:\n");
         printf("    Runtime: %lld seconds\n", static_cast<long long>(totalElapsed));
-        printf("    Captured: %llu frames (%.1f fps avg)\n", totalCaptured,
+        printf("    Input captured: %llu frames (%.1f fps avg)\n", totalCaptured,
                totalCaptured / static_cast<double>(totalElapsed));
-        printf("    Processed: %llu frames (%.1f fps avg)\n", totalProcessed,
+        printf("    Input processed: %llu frames (%.1f fps avg)\n", totalProcessed,
                totalProcessed / static_cast<double>(totalElapsed));
-        printf("    Played: %llu frames (%.1f fps avg)\n", totalPlayed,
+        printf("    Output played: %llu frames (%.1f fps avg)\n", totalPlayed,
                totalPlayed / static_cast<double>(totalElapsed));
-        printf("    Loss rate: %.3f%%\n",
-               totalCaptured > 0 ? ((totalCaptured - totalProcessed) * 100.0 / totalCaptured) : 0.0);
     }
 }
 

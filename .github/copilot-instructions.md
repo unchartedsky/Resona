@@ -33,6 +33,9 @@ Apply these repository-agnostic guidelines first, then apply project-specific ex
 - Evolve architecture: treat VulkanUpsampler as one renderer path; design the system to support composing AI models and multiple renderer backends into the render pipeline and to progress the upsampler toward a sound rendering engine.
 - Add a simple UI to display input/output source information and allow users to configure filter combinations and settings.
 - Document the forward-looking architecture and renderer composition strategy in AGENTS.md.
+- Preserve captured initial buffer level in pressure/target logic; rely on captured startup calibration as the baseline rather than enforcing a fixed setpoint.
+- Treat a fixed bootstrap fallback (15%) as only an initial safety; make it have little ongoing effect once startup calibration is captured and adaptive behavior is active.
+- Ensure pressure/target logic can be explicitly reinitialized or overridden and document the behavior and configuration options.
 
 ## Documentation Requirements
 - Include explicit checks for Vulkan version and miniaudio version in README documentation.

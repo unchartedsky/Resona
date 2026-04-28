@@ -51,7 +51,7 @@ class VulkanUpsampler : public GpuUpsampler
     struct AdaptivePolicy
     {
         static constexpr uint32_t FixedBatchFrames = 512;
-        static constexpr uint32_t TargetBufferPercent = 30;
+        static constexpr uint32_t TargetBufferPercent = 15;
         static constexpr uint32_t MaxSubmittedBatches = 4;
 
         static constexpr float SubmitCriticalThreshold = 0.4f;

@@ -1593,6 +1593,6 @@ void VulkanUpsampler::resetAdaptiveTarget()
 {
     // Reset the captured flag to force a new capture on the next update loop
     adaptiveState.initialLevelCaptured = false;
-    printf("[+] Adaptive target reset requested (re-calibration)\n");
+    printf("[+] Adaptive target reset for startup calibration\n");
 }
 

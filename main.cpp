@@ -331,6 +331,9 @@ int main()
     // Graceful shutdown sequence
     printf("[*] Initiating shutdown sequence...\n");
 
+    // Mark runtime as stopping so callbacks and other runtime paths observe shutdown consistently.
+    g_running.store(false, std::memory_order_release);
+
     // Mark GPU as not ready
     g_gpuReady.store(false, std::memory_order_release);
 

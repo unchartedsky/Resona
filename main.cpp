@@ -27,45 +27,16 @@
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 
+#include "Audio/AudioConfig.h"
 #include "Audio/AudioDeviceManager.h"
 #include "Audio/AudioCallbackContext.h"
 #include "Audio/FloatRingBuffer.h"
 #include "GpuUpsampler.h"
 #include "RenderPipeline/GpuProcessingThread.h"
+#include "Runtime/AppRuntime.h"
+#include "Runtime/RuntimeHooks.h"
 #include "VulkanUpsampler.h"
 #include "Runtime/StatusReporter.h"
-
-// === Configuration Constants ===
-namespace AudioConfig
-{
-static constexpr uint32_t INPUT_SAMPLE_RATE = 44100;
-static constexpr uint32_t OUTPUT_SAMPLE_RATE = 384000;
-static constexpr uint32_t CHANNELS = 2;
-
-// DUAL BUFFER ARCHITECTURE:
-// Input buffer: Stores captured 44.1kHz audio (fast writes from capture callback)
-// Output buffer: Stores upsampled 384kHz audio (reads from playback callback)
-
-// OPTIMIZED: Power-of-2 buffer sizes for optimal modulo performance
-// Input buffer: 2 seconds @ 44.1kHz = ~88200 frames -> round up to 131072 (2^17)
-static constexpr uint32_t INPUT_RING_BUFFER_FRAMES = 131072; // Power of 2 (2^17 = 131072 frames)
-
-// Output buffer: 2 seconds @ 384kHz = ~768000 frames -> round up to 1048576 (2^20)
-static constexpr uint32_t OUTPUT_RING_BUFFER_FRAMES = 1048576; // Power of 2 (2^20 = 1048576 frames)
-
-// OPTIMIZED: Increased prebuffer to 400ms for stable startup (prevent initial underrun)
-static constexpr uint32_t PREBUFFER_FRAMES = OUTPUT_SAMPLE_RATE * 40 / 100; // 400ms @ 384kHz
-
-// CRITICAL: Safety threshold to prevent underruns
-static constexpr uint32_t MIN_BUFFER_FRAMES = OUTPUT_SAMPLE_RATE * 25 / 100; // 250ms @ 384kHz
-
-static constexpr uint32_t SLEEP_INTERVAL_MS = 5;
-static constexpr uint32_t MAIN_LOOP_SLEEP_MS = 10;
-
-// GPU processing thread sleep interval when no work available
-static constexpr uint32_t GPU_THREAD_SLEEP_MS = 1;
-
-} // namespace AudioConfig
 
 // === Global State ===
 std::atomic<bool> g_running{true};
@@ -78,16 +49,16 @@ std::atomic<uint64_t> g_processedInputFrames{0};  // Track total processed input
 std::atomic<uint64_t> g_processedOutputFrames{0}; // Track total output frames added to output buffer
 std::atomic<uint64_t> g_playedOutputFrames{0};    // Track total output frames played
 
-static std::unique_ptr<GpuUpsampler> g_upsampler;
+std::unique_ptr<GpuUpsampler> g_upsampler;
 
 // === Dual Ring Buffers ===
-static FloatRingBuffer g_inputRing;  // 44.1kHz captured audio
-static FloatRingBuffer g_outputRing; // 384kHz upsampled audio
+FloatRingBuffer g_inputRing;  // 44.1kHz captured audio
+FloatRingBuffer g_outputRing; // 384kHz upsampled audio
 
-static GpuProcessingContext g_gpuProcessingContext;
-static GpuProcessingThread g_gpuProcessor(&g_gpuProcessingContext);
+GpuProcessingContext g_gpuProcessingContext;
+GpuProcessingThread g_gpuProcessor(&g_gpuProcessingContext);
 
-static void waitForOutputPrebuffer()
+void waitForOutputPrebuffer()
 {
     // Add 5% safety margin to prevent initial underrun
     const uint32_t targetFrames = AudioConfig::PREBUFFER_FRAMES;
@@ -230,127 +201,17 @@ void runMainLoop(AudioDeviceManager &deviceManager)
     StatusReporter::PrintSessionStatistics(sessionStatistics);
 }
 
-// === Main Application ===
 int main()
 {
     std::signal(SIGINT, signal_handler);
 
-    printf("[*] Initializing GPU upsampler...\n");
-
-    // Step 1: Initialize GPU upsampler
-    g_upsampler = std::make_unique<VulkanUpsampler>();
-    if (!g_upsampler->initialize(AudioConfig::INPUT_SAMPLE_RATE, AudioConfig::OUTPUT_SAMPLE_RATE,
-                                 AudioConfig::CHANNELS))
+    AppRuntime appRuntime;
+    if (!appRuntime.Initialize())
     {
-        printf("[!] Failed to initialize upsampler\n");
         return EXIT_FAILURE;
     }
 
-    // Step 2: Load shader - use Nearest for noise-free resampling
-    g_upsampler->setKernel(ResampleKernel::Nearest);
-
-    // Step 3: Initialize dual ring buffers
-    printf("[*] Initializing dual ring buffers...\n");
-    g_inputRing.init(AudioConfig::INPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS);
-    g_outputRing.init(AudioConfig::OUTPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS);
-
-    // Step 4: Mark GPU as ready
-    g_gpuProcessingContext.gpuReady = &g_gpuReady;
-    g_gpuProcessingContext.upsampler = static_cast<VulkanUpsampler *>(g_upsampler.get());
-    g_gpuProcessingContext.inputRing = &g_inputRing;
-    g_gpuProcessingContext.outputRing = &g_outputRing;
-    g_gpuProcessingContext.processedInputFrames = &g_processedInputFrames;
-    g_gpuProcessingContext.processedOutputFrames = &g_processedOutputFrames;
-    g_gpuProcessingContext.inputSampleRate = AudioConfig::INPUT_SAMPLE_RATE;
-    g_gpuProcessingContext.outputSampleRate = AudioConfig::OUTPUT_SAMPLE_RATE;
-    g_gpuProcessingContext.channels = AudioConfig::CHANNELS;
-    g_gpuProcessingContext.outputRingCapacityFrames = AudioConfig::OUTPUT_RING_BUFFER_FRAMES;
-    g_gpuProcessingContext.idleSleepMs = AudioConfig::GPU_THREAD_SLEEP_MS;
-
-    g_gpuReady.store(true, std::memory_order_release);
-
-    // Step 5: Start GPU processing thread
-    printf("[*] Starting GPU processing thread...\n");
-    g_gpuProcessor.start();
-
-    printf("[*] Initializing audio devices...\n");
-
-    // Step 6: Initialize audio devices
-    AudioCallbackContext audioCallbackContext{};
-    audioCallbackContext.running = &g_running;
-    audioCallbackContext.underrun = &g_underrun;
-    audioCallbackContext.inputRing = &g_inputRing;
-    audioCallbackContext.outputRing = &g_outputRing;
-    audioCallbackContext.capturedInputFrames = &g_capturedInputFrames;
-    audioCallbackContext.playedOutputFrames = &g_playedOutputFrames;
-    audioCallbackContext.channels = AudioConfig::CHANNELS;
-    audioCallbackContext.minBufferFrames = AudioConfig::MIN_BUFFER_FRAMES;
-
-    AudioDeviceManager deviceManager(&audioCallbackContext);
-    if (!deviceManager.initializeCapture() || !deviceManager.initializePlayback())
-    {
-        g_gpuReady.store(false, std::memory_order_release);
-        g_gpuProcessor.stop();
-        return EXIT_FAILURE;
-    }
-
-    // Step 7: Start capture first so input/output generation can begin
-    if (!deviceManager.startCapture())
-    {
-        g_gpuReady.store(false, std::memory_order_release);
-        g_gpuProcessor.stop();
-        return EXIT_FAILURE;
-    }
-
-    // Step 8: Wait for output prebuffer before enabling playback
-    waitForOutputPrebuffer();
-
-    if (!deviceManager.startPlayback())
-    {
-        g_gpuReady.store(false, std::memory_order_release);
-        g_gpuProcessor.stop();
-        deviceManager.stopDevices();
-        return EXIT_FAILURE;
-    }
-
-    // Step 9: Reset adaptive target now that prebuffer is complete and stable
-    // This ensures we capture the full buffer level (e.g. 15%) as the target, not the initial empty state
-    if (g_upsampler)
-    {
-        static_cast<VulkanUpsampler *>(g_upsampler.get())->resetAdaptiveTarget();
-    }
-
-    printf("[+] Real-time GPU upsampler started (%u -> %uHz)\n", AudioConfig::INPUT_SAMPLE_RATE,
-           AudioConfig::OUTPUT_SAMPLE_RATE);
-    printf("[*] Architecture: Capture -> Input Buffer (44.1kHz) -> GPU -> Output Buffer (384kHz) -> Playback\n");
-    printf("[*] Press Ctrl+C to stop...\n");
-
-    // Run main processing loop
-    runMainLoop(deviceManager);
-
-    // Graceful shutdown sequence
-    printf("[*] Initiating shutdown sequence...\n");
-
-    // Mark runtime as stopping so callbacks and other runtime paths observe shutdown consistently.
-    g_running.store(false, std::memory_order_release);
-
-    // Mark GPU as not ready
-    g_gpuReady.store(false, std::memory_order_release);
-
-    // Step 1: Stop GPU processing thread
-    printf("[*] Stopping GPU processing thread...\n");
-    g_gpuProcessor.stop();
-
-    // Step 2: Stop audio devices
-    deviceManager.stopDevices();
-
-    // Step 3: Cleanup GPU resources
-    if (g_upsampler)
-    {
-        g_upsampler->shutdown();
-        g_upsampler.reset();
-    }
-
-    printf("[+] Graceful shutdown complete.\n");
-    return EXIT_SUCCESS;
+    const int exitCode = appRuntime.Run();
+    appRuntime.Shutdown();
+    return exitCode;
 }

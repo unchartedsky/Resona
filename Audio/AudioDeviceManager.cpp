@@ -260,13 +260,35 @@ void AudioDeviceManager::playback_callback(ma_device *device, void *output, cons
     }
 
     const uint32_t actualSamples = context->outputRing->pop(outputSamples, requiredSamples);
+    const uint32_t remainingFrames = context->outputRing->available() / context->channels;
+
+    if (context->minObservedOutputFrames)
+    {
+        uint32_t currentMin = context->minObservedOutputFrames->load(std::memory_order_relaxed);
+        while (remainingFrames < currentMin &&
+               !context->minObservedOutputFrames->compare_exchange_weak(currentMin, remainingFrames,
+                                                                        std::memory_order_relaxed,
+                                                                        std::memory_order_relaxed))
+        {
+        }
+    }
 
     if (actualSamples < requiredSamples) [[unlikely]]
     {
+        const uint32_t zeroFillSamples = requiredSamples - actualSamples;
         const size_t remainingBytes = (requiredSamples - actualSamples) * sizeof(float);
         std::memset(outputSamples + actualSamples, 0, remainingBytes);
 
-        const uint32_t remainingFrames = context->outputRing->available() / context->channels;
+        if (context->zeroFillEvents)
+        {
+            context->zeroFillEvents->fetch_add(1, std::memory_order_relaxed);
+        }
+
+        if (context->zeroFillSamples)
+        {
+            context->zeroFillSamples->fetch_add(zeroFillSamples, std::memory_order_relaxed);
+        }
+
         if (context->underrun && remainingFrames < context->minBufferFrames)
         {
             context->underrun->store(true, std::memory_order_relaxed);

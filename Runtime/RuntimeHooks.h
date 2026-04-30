@@ -17,6 +17,9 @@ extern std::atomic<uint64_t> g_capturedInputFrames;
 extern std::atomic<uint64_t> g_processedInputFrames;
 extern std::atomic<uint64_t> g_processedOutputFrames;
 extern std::atomic<uint64_t> g_playedOutputFrames;
+extern std::atomic<uint64_t> g_zeroFillEvents;
+extern std::atomic<uint64_t> g_zeroFillSamples;
+extern std::atomic<uint32_t> g_minObservedOutputFrames;
 
 extern std::unique_ptr<GpuUpsampler> g_upsampler;
 extern FloatRingBuffer g_inputRing;

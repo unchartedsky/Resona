@@ -12,6 +12,9 @@ struct RuntimeStatusSnapshot
     float baseRatio = 0.0f;
     float targetFillRatio = 0.0f;
     uint32_t outputRingCapacityFrames = 0;
+    uint32_t minObservedOutputFrames = 0;
+    uint64_t zeroFillEvents = 0;
+    uint64_t zeroFillSamples = 0;
     long long totalElapsedSeconds = 0;
 };
 
@@ -21,6 +24,9 @@ struct SessionStatistics
     uint64_t totalCapturedFrames = 0;
     uint64_t totalProcessedFrames = 0;
     uint64_t totalPlayedFrames = 0;
+    uint32_t minObservedOutputFrames = 0;
+    uint64_t zeroFillEvents = 0;
+    uint64_t zeroFillSamples = 0;
 };
 
 class StatusReporter

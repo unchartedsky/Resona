@@ -1539,10 +1539,10 @@ void VulkanUpsampler::updateAdaptiveParams(uint32_t outputBufferLevel, uint32_t 
 
     adaptiveState.targetBufferLevel = effectiveTarget;
 
-    // Calculate buffer pressure (0.0 = empty, 1.0 = at or above target)
+    // Calculate target-relative fill ratio.
     if (effectiveTarget > 0)
     {
-        adaptiveState.bufferPressure = std::min(1.0f, static_cast<float>(outputBufferLevel) / effectiveTarget);
+        adaptiveState.bufferPressure = static_cast<float>(outputBufferLevel) / effectiveTarget;
     }
     else
     {
@@ -1554,19 +1554,18 @@ void VulkanUpsampler::updateAdaptiveParams(uint32_t outputBufferLevel, uint32_t 
 
     // === ADAPTIVE RATIO ADJUSTMENT ===
     // Strategy:
-    // - Use a very small drift correction only when buffer level is meaningfully
-    //   below target. This compensates for DAC / driver clock mismatches without
-    //   causing large audible pitch or speed changes.
+    // - Use a very small signed drift correction around the captured target level.
+    //   This compensates for DAC / driver clock mismatches without causing large
+    //   audible pitch or speed changes.
     // - Keep a deadband near target so small fluctuations do not modulate ratio.
     // - Smooth ratio changes over time to avoid abrupt transitions.
     float targetRatio = adaptiveState.baseRatio;
-    if (adaptiveState.bufferPressure < AdaptivePolicy::DriftDeadbandPressure)
+    const float ratioDeltaFromTarget = adaptiveState.bufferPressure - 1.0f;
+    if (std::abs(ratioDeltaFromTarget) > AdaptivePolicy::DriftDeadbandRatioDelta)
     {
-        const float normalizedDeficit =
-            (AdaptivePolicy::DriftDeadbandPressure - adaptiveState.bufferPressure) /
-            AdaptivePolicy::DriftDeadbandPressure;
-        const float boostFactor = normalizedDeficit * AdaptivePolicy::DriftMaxBoost;
-        targetRatio = adaptiveState.baseRatio * (1.0f + boostFactor);
+        const float signedError = std::clamp(ratioDeltaFromTarget, -1.0f, 1.0f);
+        const float correction = signedError * AdaptivePolicy::DriftMaxCorrection;
+        targetRatio = adaptiveState.baseRatio * (1.0f - correction);
     }
 
     adaptiveState.currentRatio =

@@ -15,6 +15,9 @@ struct AudioCallbackContext
 
     std::atomic<uint64_t> *capturedInputFrames = nullptr;
     std::atomic<uint64_t> *playedOutputFrames = nullptr;
+    std::atomic<uint64_t> *zeroFillEvents = nullptr;
+    std::atomic<uint64_t> *zeroFillSamples = nullptr;
+    std::atomic<uint32_t> *minObservedOutputFrames = nullptr;
 
     uint32_t channels = 0;
     uint32_t minBufferFrames = 0;

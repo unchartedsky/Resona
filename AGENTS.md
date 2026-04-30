@@ -26,9 +26,57 @@ The GPU processing path can evolve toward a sound rendering engine with more adv
 
 This part of the system may eventually include:
 - multiple rendering kernels
+- composition of multiple renderer backends within one render pipeline
+- chaining or combining AI models with renderer stages
 - richer interpolation / synthesis strategies
 - GPU-driven sound generation or transformation
 - more flexible scheduling and buffering policies
+
+## Current Runtime Shape
+
+The current codebase is moving toward a thin application entry point with explicit subsystem boundaries.
+
+### Runtime layers
+- `Runtime/`
+  - application orchestration
+  - shared runtime hooks
+  - status and session reporting
+- `Audio/`
+  - device lifecycle
+  - callback-facing state
+  - ring buffer transport
+  - shared audio configuration
+- `RenderPipeline/`
+  - GPU worker thread
+  - submission planning and scheduling policy
+- `VulkanUpsampler`
+  - one renderer backend implementation inside the broader rendering direction
+
+### Near-term intent
+- keep `main.cpp` as a thin entry point and high-level control handoff
+- keep audio callback paths explicit and minimal
+- keep renderer scheduling policy separable from device and buffer management
+- treat `VulkanUpsampler` as one backend path, not the final architecture boundary
+
+## Buffering And Drift Control Notes
+
+- Startup calibration should capture the initial output buffer level and use it as the adaptive baseline.
+- The fixed 15% bootstrap target is only a safety fallback before startup calibration is established.
+- Ongoing pressure / target behavior should be driven primarily by captured startup conditions and live drift telemetry, not by a permanently enforced fixed setpoint.
+- Reinitializing or overriding pressure / target state should remain an explicit runtime action so device restarts and diagnostics can reset the controller cleanly.
+
+## Telemetry Priorities
+
+When diagnosing playback quality, prioritize worst-case margin over average fill level.
+
+Important runtime signals:
+- current output buffer level
+- minimum observed output buffer level
+- zero-fill event count
+- zero-fill sample count
+- adaptive ratio drift relative to base ratio
+
+These metrics should guide tuning for device-specific drift behavior and underrun recovery.
 
 ## API Design Guidance
 

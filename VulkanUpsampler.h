@@ -60,8 +60,8 @@ class VulkanUpsampler : public GpuUpsampler
         static constexpr float SleepCriticalThreshold = 0.3f;
         static constexpr float SleepLowThreshold = 0.6f;
 
-        static constexpr float DriftDeadbandPressure = 0.98f;
-        static constexpr float DriftMaxBoost = 0.002f;
+        static constexpr float DriftDeadbandRatioDelta = 0.02f;
+        static constexpr float DriftMaxCorrection = 0.002f;
         static constexpr float DriftSmoothingFactor = 0.05f;
     };
 

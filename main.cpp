@@ -48,6 +48,9 @@ std::atomic<uint64_t> g_capturedInputFrames{0};   // Track total captured input 
 std::atomic<uint64_t> g_processedInputFrames{0};  // Track total processed input frames
 std::atomic<uint64_t> g_processedOutputFrames{0}; // Track total output frames added to output buffer
 std::atomic<uint64_t> g_playedOutputFrames{0};    // Track total output frames played
+std::atomic<uint64_t> g_zeroFillEvents{0};        // Track playback callbacks that had to zero-fill
+std::atomic<uint64_t> g_zeroFillSamples{0};       // Track total zero-filled samples
+std::atomic<uint32_t> g_minObservedOutputFrames{UINT32_MAX}; // Track worst-case output buffer depth
 
 std::unique_ptr<GpuUpsampler> g_upsampler;
 
@@ -173,6 +176,11 @@ void runMainLoop(AudioDeviceManager &deviceManager)
             statusSnapshot.baseRatio = baseRatio;
             statusSnapshot.targetFillRatio = bufferPressure;
             statusSnapshot.outputRingCapacityFrames = AudioConfig::OUTPUT_RING_BUFFER_FRAMES;
+            const uint32_t minObservedOutputFrames = g_minObservedOutputFrames.load(std::memory_order_relaxed);
+            statusSnapshot.minObservedOutputFrames =
+                minObservedOutputFrames == UINT32_MAX ? outputBufferFrames : minObservedOutputFrames;
+            statusSnapshot.zeroFillEvents = g_zeroFillEvents.load(std::memory_order_relaxed);
+            statusSnapshot.zeroFillSamples = g_zeroFillSamples.load(std::memory_order_relaxed);
             statusSnapshot.totalElapsedSeconds = totalElapsed;
             StatusReporter::PrintStatusLine(statusSnapshot);
 
@@ -192,12 +200,17 @@ void runMainLoop(AudioDeviceManager &deviceManager)
     const uint64_t totalCaptured = g_capturedInputFrames.load(std::memory_order_relaxed);
     const uint64_t totalProcessed = g_processedInputFrames.load(std::memory_order_relaxed);
     const uint64_t totalPlayed = g_playedOutputFrames.load(std::memory_order_relaxed);
+    const uint32_t minObservedOutputFrames = g_minObservedOutputFrames.load(std::memory_order_relaxed);
 
     SessionStatistics sessionStatistics{};
     sessionStatistics.totalElapsedSeconds = totalElapsed;
     sessionStatistics.totalCapturedFrames = totalCaptured;
     sessionStatistics.totalProcessedFrames = totalProcessed;
     sessionStatistics.totalPlayedFrames = totalPlayed;
+    sessionStatistics.minObservedOutputFrames =
+        minObservedOutputFrames == UINT32_MAX ? 0 : minObservedOutputFrames;
+    sessionStatistics.zeroFillEvents = g_zeroFillEvents.load(std::memory_order_relaxed);
+    sessionStatistics.zeroFillSamples = g_zeroFillSamples.load(std::memory_order_relaxed);
     StatusReporter::PrintSessionStatistics(sessionStatistics);
 }
 

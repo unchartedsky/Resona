@@ -24,6 +24,9 @@ bool AppRuntime::Initialize()
     printf("[*] Initializing dual ring buffers...\n");
     g_inputRing.init(AudioConfig::INPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS);
     g_outputRing.init(AudioConfig::OUTPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS);
+    g_zeroFillEvents.store(0, std::memory_order_relaxed);
+    g_zeroFillSamples.store(0, std::memory_order_relaxed);
+    g_minObservedOutputFrames.store(AudioConfig::OUTPUT_RING_BUFFER_FRAMES, std::memory_order_relaxed);
 
     g_gpuProcessingContext.gpuReady = &g_gpuReady;
     g_gpuProcessingContext.upsampler = static_cast<VulkanUpsampler *>(g_upsampler.get());
@@ -49,6 +52,9 @@ bool AppRuntime::Initialize()
     audioCallbackContext.outputRing = &g_outputRing;
     audioCallbackContext.capturedInputFrames = &g_capturedInputFrames;
     audioCallbackContext.playedOutputFrames = &g_playedOutputFrames;
+    audioCallbackContext.zeroFillEvents = &g_zeroFillEvents;
+    audioCallbackContext.zeroFillSamples = &g_zeroFillSamples;
+    audioCallbackContext.minObservedOutputFrames = &g_minObservedOutputFrames;
     audioCallbackContext.channels = AudioConfig::CHANNELS;
     audioCallbackContext.minBufferFrames = AudioConfig::MIN_BUFFER_FRAMES;
 
@@ -70,6 +76,7 @@ bool AppRuntime::Initialize()
     }
 
     waitForOutputPrebuffer();
+    g_minObservedOutputFrames.store(g_outputRing.available() / AudioConfig::CHANNELS, std::memory_order_relaxed);
 
     if (!deviceManager->startPlayback())
     {

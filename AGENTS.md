@@ -37,6 +37,10 @@ This part of the system may eventually include:
 The current codebase is moving toward a thin application entry point with explicit subsystem boundaries.
 
 ### Runtime layers
+- `main.cpp`
+  - process entry point
+  - signal handling
+  - handoff into `AppRuntime`
 - `Runtime/`
   - application orchestration
   - shared runtime hooks

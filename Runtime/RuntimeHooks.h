@@ -26,6 +26,3 @@ extern FloatRingBuffer g_inputRing;
 extern FloatRingBuffer g_outputRing;
 extern GpuProcessingContext g_gpuProcessingContext;
 extern GpuProcessingThread g_gpuProcessor;
-
-void waitForOutputPrebuffer();
-void runMainLoop(class AudioDeviceManager &deviceManager);

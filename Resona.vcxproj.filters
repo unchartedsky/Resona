@@ -74,9 +74,6 @@
     <ClInclude Include="Audio\AudioConfig.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="Runtime\RuntimeHooks.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <None Include="linear.comp">

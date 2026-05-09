@@ -152,7 +152,6 @@
     <ClInclude Include="RenderPipeline\GpuProcessingThread.h" />
     <ClInclude Include="RenderPipeline\SubmissionPlanner.h" />
     <ClInclude Include="Runtime\AppRuntime.h" />
-    <ClInclude Include="Runtime\RuntimeHooks.h" />
     <ClInclude Include="Runtime\StatusReporter.h" />
     <ClInclude Include="VulkanUpsampler.h" />
   </ItemGroup>

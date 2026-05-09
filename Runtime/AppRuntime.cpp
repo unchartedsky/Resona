@@ -2,7 +2,6 @@
 
 #include "../Audio/AudioConfig.h"
 #include "StatusReporter.h"
-#include "RuntimeHooks.h"
 #include "../VulkanUpsampler.h"
 
 #include <algorithm>
@@ -12,6 +11,11 @@
 #include <memory>
 #include <thread>
 
+AppRuntime::AppRuntime()
+    : gpuProcessor(&gpuProcessingContext)
+{
+}
+
 void AppRuntime::waitForOutputPrebuffer() const
 {
     const uint32_t targetFrames = AudioConfig::PREBUFFER_FRAMES;
@@ -20,9 +24,9 @@ void AppRuntime::waitForOutputPrebuffer() const
 
     printf("[*] Waiting for prebuffer (target: %u frames + %u margin)...\n", targetFrames, safetyMargin);
 
-    while (g_outputRing.available() / AudioConfig::CHANNELS < safeTargetFrames)
+    while (outputRing.available() / AudioConfig::CHANNELS < safeTargetFrames)
     {
-        const uint32_t currentFrames = g_outputRing.available() / AudioConfig::CHANNELS;
+        const uint32_t currentFrames = outputRing.available() / AudioConfig::CHANNELS;
         printf("    Progress: %u/%u frames (%.1f%%)     \r", currentFrames, safeTargetFrames,
                (currentFrames * 100.0f) / safeTargetFrames);
         fflush(stdout);
@@ -30,7 +34,7 @@ void AppRuntime::waitForOutputPrebuffer() const
     }
 
     printf("\n[+] Prebuffer complete (filled: %u frames)                    \n",
-           g_outputRing.available() / AudioConfig::CHANNELS);
+           outputRing.available() / AudioConfig::CHANNELS);
 }
 
 void AppRuntime::runMainLoop()
@@ -39,31 +43,31 @@ void AppRuntime::runMainLoop()
     auto startTime = std::chrono::steady_clock::now();
     uint32_t lastOutputBufferLevel = 0;
 
-    while (g_running)
+    while (running)
     {
-        if (g_underrun.exchange(false))
+        if (underrun.exchange(false))
         {
             printf("\r%*s\r", 120, "");
             printf("[!] Underrun detected. Re-buffering...\n");
 
-            g_restartRequested.store(true, std::memory_order_release);
+            restartRequested.store(true, std::memory_order_release);
         }
 
-        if (g_restartRequested.load(std::memory_order_acquire) &&
-            !g_restartInProgress.exchange(true, std::memory_order_acq_rel))
+        if (restartRequested.load(std::memory_order_acquire) &&
+            !restartInProgress.exchange(true, std::memory_order_acq_rel))
         {
-            g_restartRequested.store(false, std::memory_order_release);
+            restartRequested.store(false, std::memory_order_release);
 
             if (deviceManager && deviceManager->restartPlayback())
             {
                 printf("[+] Playback resumed after underrun\n");
-                g_restartInProgress.store(false, std::memory_order_release);
+                restartInProgress.store(false, std::memory_order_release);
             }
             else
             {
                 printf("[!] Failed to restart playback after underrun\n");
-                g_running.store(false, std::memory_order_release);
-                g_restartInProgress.store(false, std::memory_order_release);
+                running.store(false, std::memory_order_release);
+                restartInProgress.store(false, std::memory_order_release);
                 break;
             }
         }
@@ -73,9 +77,9 @@ void AppRuntime::runMainLoop()
 
         if (elapsedMs >= 500)
         {
-            const uint32_t outputBufferFrames = g_outputRing.available() / AudioConfig::CHANNELS;
+            const uint32_t outputBufferFrames = outputRing.available() / AudioConfig::CHANNELS;
 
-            const auto *vulkanUpsampler = static_cast<VulkanUpsampler *>(g_upsampler.get());
+            const auto *vulkanUpsampler = static_cast<VulkanUpsampler *>(upsampler.get());
             const size_t availableSlots = vulkanUpsampler->getAvailableSlots();
             const float currentRatio = vulkanUpsampler->getCurrentRatio();
 
@@ -105,11 +109,11 @@ void AppRuntime::runMainLoop()
             statusSnapshot.baseRatio = baseRatio;
             statusSnapshot.targetFillRatio = bufferPressure;
             statusSnapshot.outputRingCapacityFrames = AudioConfig::OUTPUT_RING_BUFFER_FRAMES;
-            const uint32_t minObservedOutputFrames = g_minObservedOutputFrames.load(std::memory_order_relaxed);
+            const uint32_t minOutputFrames = this->minObservedOutputFrames.load(std::memory_order_relaxed);
             statusSnapshot.minObservedOutputFrames =
-                minObservedOutputFrames == UINT32_MAX ? outputBufferFrames : minObservedOutputFrames;
-            statusSnapshot.zeroFillEvents = g_zeroFillEvents.load(std::memory_order_relaxed);
-            statusSnapshot.zeroFillSamples = g_zeroFillSamples.load(std::memory_order_relaxed);
+                minOutputFrames == UINT32_MAX ? outputBufferFrames : minOutputFrames;
+            statusSnapshot.zeroFillEvents = zeroFillEvents.load(std::memory_order_relaxed);
+            statusSnapshot.zeroFillSamples = zeroFillSamples.load(std::memory_order_relaxed);
             statusSnapshot.totalElapsedSeconds = totalElapsed;
             StatusReporter::PrintStatusLine(statusSnapshot);
 
@@ -123,10 +127,10 @@ void AppRuntime::runMainLoop()
 
     auto totalElapsed =
         std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - startTime).count();
-    const uint64_t totalCaptured = g_capturedInputFrames.load(std::memory_order_relaxed);
-    const uint64_t totalProcessed = g_processedInputFrames.load(std::memory_order_relaxed);
-    const uint64_t totalPlayed = g_playedOutputFrames.load(std::memory_order_relaxed);
-    const uint32_t minObservedOutputFrames = g_minObservedOutputFrames.load(std::memory_order_relaxed);
+    const uint64_t totalCaptured = capturedInputFrames.load(std::memory_order_relaxed);
+    const uint64_t totalProcessed = processedInputFrames.load(std::memory_order_relaxed);
+    const uint64_t totalPlayed = playedOutputFrames.load(std::memory_order_relaxed);
+    const uint32_t minOutputFrames = this->minObservedOutputFrames.load(std::memory_order_relaxed);
 
     SessionStatistics sessionStatistics{};
     sessionStatistics.totalElapsedSeconds = totalElapsed;
@@ -134,9 +138,9 @@ void AppRuntime::runMainLoop()
     sessionStatistics.totalProcessedFrames = totalProcessed;
     sessionStatistics.totalPlayedFrames = totalPlayed;
     sessionStatistics.minObservedOutputFrames =
-        minObservedOutputFrames == UINT32_MAX ? 0 : minObservedOutputFrames;
-    sessionStatistics.zeroFillEvents = g_zeroFillEvents.load(std::memory_order_relaxed);
-    sessionStatistics.zeroFillSamples = g_zeroFillSamples.load(std::memory_order_relaxed);
+        minOutputFrames == UINT32_MAX ? 0 : minOutputFrames;
+    sessionStatistics.zeroFillEvents = zeroFillEvents.load(std::memory_order_relaxed);
+    sessionStatistics.zeroFillSamples = zeroFillSamples.load(std::memory_order_relaxed);
     StatusReporter::PrintSessionStatistics(sessionStatistics);
 }
 
@@ -144,84 +148,87 @@ bool AppRuntime::Initialize()
 {
     printf("[*] Initializing GPU upsampler...\n");
 
-    g_upsampler = std::make_unique<VulkanUpsampler>();
-    if (!g_upsampler->initialize(AudioConfig::INPUT_SAMPLE_RATE, AudioConfig::OUTPUT_SAMPLE_RATE, AudioConfig::CHANNELS))
+    upsampler = std::make_unique<VulkanUpsampler>();
+    if (!upsampler->initialize(AudioConfig::INPUT_SAMPLE_RATE, AudioConfig::OUTPUT_SAMPLE_RATE, AudioConfig::CHANNELS))
     {
         printf("[!] Failed to initialize upsampler\n");
         return false;
     }
 
-    g_upsampler->setKernel(ResampleKernel::Nearest);
+    upsampler->setKernel(ResampleKernel::Nearest);
 
     printf("[*] Initializing dual ring buffers...\n");
-    g_inputRing.init(AudioConfig::INPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS);
-    g_outputRing.init(AudioConfig::OUTPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS);
-    g_zeroFillEvents.store(0, std::memory_order_relaxed);
-    g_zeroFillSamples.store(0, std::memory_order_relaxed);
-    g_minObservedOutputFrames.store(AudioConfig::OUTPUT_RING_BUFFER_FRAMES, std::memory_order_relaxed);
+    inputRing.init(AudioConfig::INPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS);
+    outputRing.init(AudioConfig::OUTPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS);
+    zeroFillEvents.store(0, std::memory_order_relaxed);
+    zeroFillSamples.store(0, std::memory_order_relaxed);
+    minObservedOutputFrames.store(AudioConfig::OUTPUT_RING_BUFFER_FRAMES, std::memory_order_relaxed);
 
-    g_gpuProcessingContext.gpuReady = &g_gpuReady;
-    g_gpuProcessingContext.upsampler = static_cast<VulkanUpsampler *>(g_upsampler.get());
-    g_gpuProcessingContext.inputRing = &g_inputRing;
-    g_gpuProcessingContext.outputRing = &g_outputRing;
-    g_gpuProcessingContext.processedInputFrames = &g_processedInputFrames;
-    g_gpuProcessingContext.processedOutputFrames = &g_processedOutputFrames;
-    g_gpuProcessingContext.inputSampleRate = AudioConfig::INPUT_SAMPLE_RATE;
-    g_gpuProcessingContext.outputSampleRate = AudioConfig::OUTPUT_SAMPLE_RATE;
-    g_gpuProcessingContext.channels = AudioConfig::CHANNELS;
-    g_gpuProcessingContext.outputRingCapacityFrames = AudioConfig::OUTPUT_RING_BUFFER_FRAMES;
-    g_gpuProcessingContext.idleSleepMs = AudioConfig::GPU_THREAD_SLEEP_MS;
+    gpuProcessingContext.gpuReady = &gpuReady;
+    gpuProcessingContext.upsampler = static_cast<VulkanUpsampler *>(upsampler.get());
+    gpuProcessingContext.inputRing = &inputRing;
+    gpuProcessingContext.outputRing = &outputRing;
+    gpuProcessingContext.processedInputFrames = &processedInputFrames;
+    gpuProcessingContext.processedOutputFrames = &processedOutputFrames;
+    gpuProcessingContext.inputSampleRate = AudioConfig::INPUT_SAMPLE_RATE;
+    gpuProcessingContext.outputSampleRate = AudioConfig::OUTPUT_SAMPLE_RATE;
+    gpuProcessingContext.channels = AudioConfig::CHANNELS;
+    gpuProcessingContext.outputRingCapacityFrames = AudioConfig::OUTPUT_RING_BUFFER_FRAMES;
+    gpuProcessingContext.idleSleepMs = AudioConfig::GPU_THREAD_SLEEP_MS;
 
-    g_gpuReady.store(true, std::memory_order_release);
+    gpuReady.store(true, std::memory_order_release);
 
     printf("[*] Starting GPU processing thread...\n");
-    g_gpuProcessor.start();
+    gpuProcessor.start();
 
     printf("[*] Initializing audio devices...\n");
-    audioCallbackContext.running = &g_running;
-    audioCallbackContext.underrun = &g_underrun;
-    audioCallbackContext.inputRing = &g_inputRing;
-    audioCallbackContext.outputRing = &g_outputRing;
-    audioCallbackContext.capturedInputFrames = &g_capturedInputFrames;
-    audioCallbackContext.playedOutputFrames = &g_playedOutputFrames;
-    audioCallbackContext.zeroFillEvents = &g_zeroFillEvents;
-    audioCallbackContext.zeroFillSamples = &g_zeroFillSamples;
-    audioCallbackContext.minObservedOutputFrames = &g_minObservedOutputFrames;
+    audioCallbackContext.running = &running;
+    audioCallbackContext.underrun = &underrun;
+    audioCallbackContext.inputRing = &inputRing;
+    audioCallbackContext.outputRing = &outputRing;
+    audioCallbackContext.capturedInputFrames = &capturedInputFrames;
+    audioCallbackContext.playedOutputFrames = &playedOutputFrames;
+    audioCallbackContext.zeroFillEvents = &zeroFillEvents;
+    audioCallbackContext.zeroFillSamples = &zeroFillSamples;
+    audioCallbackContext.minObservedOutputFrames = &minObservedOutputFrames;
     audioCallbackContext.channels = AudioConfig::CHANNELS;
     audioCallbackContext.minBufferFrames = AudioConfig::MIN_BUFFER_FRAMES;
 
     deviceManager = std::make_unique<AudioDeviceManager>(&audioCallbackContext);
     if (!deviceManager->initializeCapture() || !deviceManager->initializePlayback())
     {
-        g_gpuReady.store(false, std::memory_order_release);
-        g_gpuProcessor.stop();
+        gpuReady.store(false, std::memory_order_release);
+        gpuProcessor.stop();
         deviceManager.reset();
+        upsampler.reset();
         return false;
     }
 
     if (!deviceManager->startCapture())
     {
-        g_gpuReady.store(false, std::memory_order_release);
-        g_gpuProcessor.stop();
+        gpuReady.store(false, std::memory_order_release);
+        gpuProcessor.stop();
         deviceManager.reset();
+        upsampler.reset();
         return false;
     }
 
     waitForOutputPrebuffer();
-    g_minObservedOutputFrames.store(g_outputRing.available() / AudioConfig::CHANNELS, std::memory_order_relaxed);
+    minObservedOutputFrames.store(outputRing.available() / AudioConfig::CHANNELS, std::memory_order_relaxed);
 
     if (!deviceManager->startPlayback())
     {
-        g_gpuReady.store(false, std::memory_order_release);
-        g_gpuProcessor.stop();
+        gpuReady.store(false, std::memory_order_release);
+        gpuProcessor.stop();
         deviceManager->stopDevices();
         deviceManager.reset();
+        upsampler.reset();
         return false;
     }
 
-    if (g_upsampler)
+    if (upsampler)
     {
-        static_cast<VulkanUpsampler *>(g_upsampler.get())->resetAdaptiveTarget();
+        static_cast<VulkanUpsampler *>(upsampler.get())->resetAdaptiveTarget();
     }
 
     printf("[+] Real-time GPU upsampler started (%u -> %uHz)\n", AudioConfig::INPUT_SAMPLE_RATE,
@@ -244,6 +251,11 @@ int AppRuntime::Run()
     return EXIT_SUCCESS;
 }
 
+void AppRuntime::RequestStop()
+{
+    running.store(false, std::memory_order_release);
+}
+
 void AppRuntime::Shutdown()
 {
     if (!initialized)
@@ -253,11 +265,11 @@ void AppRuntime::Shutdown()
 
     printf("[*] Initiating shutdown sequence...\n");
 
-    g_running.store(false, std::memory_order_release);
-    g_gpuReady.store(false, std::memory_order_release);
+    running.store(false, std::memory_order_release);
+    gpuReady.store(false, std::memory_order_release);
 
     printf("[*] Stopping GPU processing thread...\n");
-    g_gpuProcessor.stop();
+    gpuProcessor.stop();
 
     if (deviceManager)
     {
@@ -265,10 +277,10 @@ void AppRuntime::Shutdown()
         deviceManager.reset();
     }
 
-    if (g_upsampler)
+    if (upsampler)
     {
-        g_upsampler->shutdown();
-        g_upsampler.reset();
+        upsampler->shutdown();
+        upsampler.reset();
     }
 
     initialized = false;

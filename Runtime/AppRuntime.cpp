@@ -16,6 +16,50 @@ AppRuntime::AppRuntime()
 {
 }
 
+void AppRuntime::resetRecoveryTelemetry(uint32_t initialMinOutputFrames)
+{
+    underrun.store(false, std::memory_order_relaxed);
+    restartRequested.store(false, std::memory_order_relaxed);
+    restartInProgress.store(false, std::memory_order_relaxed);
+    zeroFillEvents.store(0, std::memory_order_relaxed);
+    zeroFillSamples.store(0, std::memory_order_relaxed);
+    minObservedOutputFrames.store(initialMinOutputFrames, std::memory_order_relaxed);
+}
+
+void AppRuntime::recalibrateAdaptiveTarget(const char *reason)
+{
+    auto *vulkanUpsampler = static_cast<VulkanUpsampler *>(upsampler.get());
+    if (!vulkanUpsampler)
+    {
+        return;
+    }
+
+    if (reason && reason[0] != '\0')
+    {
+        printf("[*] Recalibrating adaptive target after %s\n", reason);
+    }
+
+    vulkanUpsampler->resetAdaptiveTarget();
+}
+
+bool AppRuntime::recoverPlaybackAfterUnderrun()
+{
+    if (!deviceManager)
+    {
+        return false;
+    }
+
+    if (!deviceManager->restartPlayback())
+    {
+        return false;
+    }
+
+    const uint32_t currentOutputFrames = outputRing.available() / AudioConfig::CHANNELS;
+    resetRecoveryTelemetry(currentOutputFrames);
+    recalibrateAdaptiveTarget("playback restart");
+    return true;
+}
+
 void AppRuntime::waitForOutputPrebuffer() const
 {
     const uint32_t targetFrames = AudioConfig::PREBUFFER_FRAMES;
@@ -58,7 +102,7 @@ void AppRuntime::runMainLoop()
         {
             restartRequested.store(false, std::memory_order_release);
 
-            if (deviceManager && deviceManager->restartPlayback())
+            if (recoverPlaybackAfterUnderrun())
             {
                 printf("[+] Playback resumed after underrun\n");
                 restartInProgress.store(false, std::memory_order_release);
@@ -160,9 +204,7 @@ bool AppRuntime::Initialize()
     printf("[*] Initializing dual ring buffers...\n");
     inputRing.init(AudioConfig::INPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS);
     outputRing.init(AudioConfig::OUTPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS);
-    zeroFillEvents.store(0, std::memory_order_relaxed);
-    zeroFillSamples.store(0, std::memory_order_relaxed);
-    minObservedOutputFrames.store(AudioConfig::OUTPUT_RING_BUFFER_FRAMES, std::memory_order_relaxed);
+    resetRecoveryTelemetry(AudioConfig::OUTPUT_RING_BUFFER_FRAMES);
 
     gpuProcessingContext.gpuReady = &gpuReady;
     gpuProcessingContext.upsampler = static_cast<VulkanUpsampler *>(upsampler.get());
@@ -214,7 +256,7 @@ bool AppRuntime::Initialize()
     }
 
     waitForOutputPrebuffer();
-    minObservedOutputFrames.store(outputRing.available() / AudioConfig::CHANNELS, std::memory_order_relaxed);
+    resetRecoveryTelemetry(outputRing.available() / AudioConfig::CHANNELS);
 
     if (!deviceManager->startPlayback())
     {
@@ -226,10 +268,7 @@ bool AppRuntime::Initialize()
         return false;
     }
 
-    if (upsampler)
-    {
-        static_cast<VulkanUpsampler *>(upsampler.get())->resetAdaptiveTarget();
-    }
+    recalibrateAdaptiveTarget("startup prebuffer");
 
     printf("[+] Real-time GPU upsampler started (%u -> %uHz)\n", AudioConfig::INPUT_SAMPLE_RATE,
            AudioConfig::OUTPUT_SAMPLE_RATE);

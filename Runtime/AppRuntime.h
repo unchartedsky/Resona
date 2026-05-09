@@ -23,6 +23,9 @@ class AppRuntime
     void RequestStop();
 
   private:
+    void resetRecoveryTelemetry(uint32_t initialMinOutputFrames);
+    void recalibrateAdaptiveTarget(const char *reason);
+    bool recoverPlaybackAfterUnderrun();
     void waitForOutputPrebuffer() const;
     void runMainLoop();
 

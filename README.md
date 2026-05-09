@@ -97,7 +97,9 @@ When diagnosing playback quality, prioritize these signals in this order:
 
 - Playback callbacks zero-fill any missing samples rather than reading invalid data.
 - If the remaining output margin drops below the configured minimum threshold, the runtime marks an underrun condition.
-- The main runtime loop then attempts a playback restart instead of leaving recovery to detached background logic.
+- `AppRuntime` owns recovery orchestration: it reacts to the underrun signal, requests playback restart through `AudioDeviceManager`, resets recovery telemetry, and triggers adaptive target recalibration.
+- `AudioDeviceManager` remains responsible only for device lifecycle operations such as playback restart.
+- `VulkanUpsampler` remains responsible for adaptive target reset/recalibration when the runtime requests it.
 
 This behavior is intentionally conservative and is meant to keep the audio I/O path predictable while drift tuning continues.
 

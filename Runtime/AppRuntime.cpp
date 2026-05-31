@@ -2,7 +2,6 @@
 
 #include "../Audio/AudioConfig.h"
 #include "StatusReporter.h"
-#include "../VulkanUpsampler.h"
 
 #include <algorithm>
 #include <chrono>
@@ -28,8 +27,7 @@ void AppRuntime::resetRecoveryTelemetry(uint32_t initialMinOutputFrames)
 
 void AppRuntime::recalibrateAdaptiveTarget(const char *reason)
 {
-    auto *vulkanUpsampler = static_cast<VulkanUpsampler *>(upsampler.get());
-    if (!vulkanUpsampler)
+    if (!upsampler)
     {
         return;
     }
@@ -39,7 +37,7 @@ void AppRuntime::recalibrateAdaptiveTarget(const char *reason)
         printf("[*] Recalibrating adaptive target after %s\n", reason);
     }
 
-    vulkanUpsampler->resetAdaptiveTarget();
+    upsampler->resetAdaptiveTarget();
 }
 
 bool AppRuntime::recoverPlaybackAfterUnderrun()

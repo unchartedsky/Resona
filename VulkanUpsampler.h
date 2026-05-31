@@ -107,7 +107,7 @@ class VulkanUpsampler : public GpuUpsampler
     uint32_t getTargetBufferLevel() const;
 
     /// @brief Reset adaptive target capture (force re-capture)
-    void resetAdaptiveTarget();
+    void resetAdaptiveTarget() override;
 
     void shutdown() override;
 

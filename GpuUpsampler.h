@@ -24,6 +24,10 @@ public:
     /// @param kernel  The resample algorithm to use.
     virtual void setKernel(ResampleKernel kernel) = 0;
 
+    /// @brief Reset any adaptive target/baseline capture used for runtime recalibration.
+    /// Default implementation is a no-op for backends without adaptive target state.
+    virtual void resetAdaptiveTarget() {}
+
     /// @brief Releases GPU resources and shuts down the upsampler.
     virtual void shutdown() = 0;
 };

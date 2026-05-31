@@ -19,6 +19,11 @@ struct SleepRule
 
 uint32_t ComputeBatchesToSubmit(const SubmissionInputs &inputs, float bufferRatio)
 {
+    if (inputs.availableSlots == 0 || inputs.availableInputFrames < inputs.batchFrames)
+    {
+        return 0;
+    }
+
     const SubmissionRule resolvedRules[] = {
         {inputs.submitCriticalThreshold, 4u, inputs.maxSubmittedBatches},
         {inputs.submitLowThreshold, 3u, 3u},

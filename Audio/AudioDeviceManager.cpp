@@ -172,15 +172,14 @@ bool AudioDeviceManager::startPlayback()
     return true;
 }
 
-bool AudioDeviceManager::restartPlayback()
+bool AudioDeviceManager::stopPlayback()
 {
     if (!playbackInitialized)
     {
         return false;
     }
 
-    ma_device_stop(&playbackDevice);
-    return ma_device_start(&playbackDevice) == MA_SUCCESS;
+    return ma_device_stop(&playbackDevice) == MA_SUCCESS;
 }
 
 void AudioDeviceManager::stopDevices()

@@ -14,7 +14,7 @@ class AudioDeviceManager
     bool startDevices();
     bool startCapture();
     bool startPlayback();
-    bool restartPlayback();
+    bool stopPlayback();
     void stopDevices();
 
     static void capture_callback(ma_device *device, void *output, const void *input, ma_uint32 frameCount);

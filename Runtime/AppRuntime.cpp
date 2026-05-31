@@ -47,15 +47,17 @@ bool AppRuntime::recoverPlaybackAfterUnderrun()
         return false;
     }
 
-    if (!deviceManager->restartPlayback())
+    if (!deviceManager->stopPlayback())
     {
         return false;
     }
 
+    waitForOutputPrebuffer();
+
     const uint32_t currentOutputFrames = outputRing.available() / AudioConfig::CHANNELS;
     resetRecoveryTelemetry(currentOutputFrames);
     recalibrateAdaptiveTarget("playback restart");
-    return true;
+    return deviceManager->startPlayback();
 }
 
 void AppRuntime::waitForOutputPrebuffer() const

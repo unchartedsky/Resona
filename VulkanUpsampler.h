@@ -109,6 +109,8 @@ class VulkanUpsampler : public GpuUpsampler
     /// @brief Reset adaptive target capture (force re-capture)
     void resetAdaptiveTarget() override;
 
+    GpuUpsamplerRuntimeStatus getRuntimeStatus() const override;
+
     void shutdown() override;
 
   private:

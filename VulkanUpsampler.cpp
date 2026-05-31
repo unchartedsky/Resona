@@ -1588,6 +1588,17 @@ uint32_t VulkanUpsampler::getTargetBufferLevel() const
     return adaptiveState.targetBufferLevel;
 }
 
+GpuUpsamplerRuntimeStatus VulkanUpsampler::getRuntimeStatus() const
+{
+    GpuUpsamplerRuntimeStatus status{};
+    const size_t availableSlots = getAvailableSlots();
+    status.totalSlots = NUM_SLOTS;
+    status.busySlots = static_cast<uint32_t>(NUM_SLOTS - availableSlots);
+    status.currentRatio = getCurrentRatio();
+    status.targetBufferLevel = getTargetBufferLevel();
+    return status;
+}
+
 void VulkanUpsampler::resetAdaptiveTarget()
 {
     // Reset the captured flag to force a new capture on the next update loop

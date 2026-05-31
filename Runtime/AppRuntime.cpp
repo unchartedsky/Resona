@@ -122,16 +122,13 @@ void AppRuntime::runMainLoop()
         if (elapsedMs >= 500)
         {
             const uint32_t outputBufferFrames = outputRing.available() / AudioConfig::CHANNELS;
-
-            const auto *vulkanUpsampler = static_cast<VulkanUpsampler *>(upsampler.get());
-            const size_t availableSlots = vulkanUpsampler->getAvailableSlots();
-            const float currentRatio = vulkanUpsampler->getCurrentRatio();
+            const GpuUpsamplerRuntimeStatus upsamplerStatus = upsampler ? upsampler->getRuntimeStatus() : GpuUpsamplerRuntimeStatus{};
 
             const int32_t outputBufferDelta =
                 static_cast<int32_t>(outputBufferFrames) - static_cast<int32_t>(lastOutputBufferLevel);
             const double outputFillRate = (outputBufferDelta * 1000.0) / elapsedMs;
 
-            const uint32_t targetBufferFrames = vulkanUpsampler->getTargetBufferLevel();
+            const uint32_t targetBufferFrames = upsamplerStatus.targetBufferLevel;
             float bufferPressure = 1.0f;
 
             if (targetBufferFrames > 0)
@@ -147,9 +144,9 @@ void AppRuntime::runMainLoop()
             RuntimeStatusSnapshot statusSnapshot{};
             statusSnapshot.outputBufferFrames = outputBufferFrames;
             statusSnapshot.outputFillRate = outputFillRate;
-            statusSnapshot.busySlots = static_cast<uint32_t>(VulkanUpsampler::NUM_SLOTS - availableSlots);
-            statusSnapshot.totalSlots = static_cast<uint32_t>(VulkanUpsampler::NUM_SLOTS);
-            statusSnapshot.currentRatio = currentRatio;
+            statusSnapshot.busySlots = upsamplerStatus.busySlots;
+            statusSnapshot.totalSlots = upsamplerStatus.totalSlots;
+            statusSnapshot.currentRatio = upsamplerStatus.currentRatio > 0.0f ? upsamplerStatus.currentRatio : baseRatio;
             statusSnapshot.baseRatio = baseRatio;
             statusSnapshot.targetFillRatio = bufferPressure;
             statusSnapshot.outputRingCapacityFrames = AudioConfig::OUTPUT_RING_BUFFER_FRAMES;

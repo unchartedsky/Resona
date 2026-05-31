@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../Audio/FloatRingBuffer.h"
+#include "../Audio/OutputBufferQueue.h"
 #include "../VulkanUpsampler.h"
 
 #include <atomic>
@@ -12,7 +13,7 @@ struct GpuProcessingContext
     std::atomic<bool> *gpuReady = nullptr;
     VulkanUpsampler *upsampler = nullptr;
     FloatRingBuffer *inputRing = nullptr;
-    FloatRingBuffer *outputRing = nullptr;
+    OutputBufferQueue *outputQueue = nullptr;
     std::atomic<uint64_t> *processedInputFrames = nullptr;
     std::atomic<uint64_t> *processedOutputFrames = nullptr;
     uint32_t inputSampleRate = 0;

@@ -10,6 +10,19 @@
 #include <windows.h>
 #endif
 
+namespace
+{
+void ReleaseCompletedOutputSlot(void *ownerContext, uint32_t slotIndex)
+{
+    if (!ownerContext)
+    {
+        return;
+    }
+
+    static_cast<VulkanUpsampler *>(ownerContext)->releaseCompletedSlot(slotIndex);
+}
+} // namespace
+
 GpuProcessingThread::GpuProcessingThread(GpuProcessingContext *context)
     : context(context)
 {
@@ -53,7 +66,7 @@ void GpuProcessingThread::runLoop()
 
     while (running)
     {
-        if (!context || !context->gpuReady || !context->upsampler || !context->inputRing || !context->outputRing)
+        if (!context || !context->gpuReady || !context->upsampler || !context->inputRing || !context->outputQueue)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
@@ -65,7 +78,7 @@ void GpuProcessingThread::runLoop()
             continue;
         }
 
-        const uint32_t outputBufferFrames = context->outputRing->available() / context->channels;
+        const uint32_t outputBufferFrames = context->outputQueue->available() / context->channels;
         const uint32_t batchFrames = VulkanUpsampler::AdaptivePolicy::FixedBatchFrames;
         const uint32_t batchSamples = batchFrames * context->channels;
         const uint32_t availableInputFrames = context->inputRing->available() / context->channels;
@@ -116,9 +129,15 @@ void GpuProcessingThread::runLoop()
 
             uint64_t sequenceId = context->upsampler->processAsync(
                 inputBuffer.data() + (i * batchSamples), readFrames,
-                [this, readFrames = readFrames](const float *output, uint32_t outputFrames) {
+                [this, readFrames = readFrames](const float *output, uint32_t outputFrames, uint32_t slotIndex) {
                     const uint32_t outputSamples = outputFrames * context->channels;
-                    context->outputRing->push(output, outputSamples);
+
+                    if (!context->outputQueue->pushBlock(output, outputSamples, context->upsampler, slotIndex,
+                                                         ReleaseCompletedOutputSlot))
+                    {
+                        ReleaseCompletedOutputSlot(context->upsampler, slotIndex);
+                        return;
+                    }
 
                     if (context->processedInputFrames)
                     {

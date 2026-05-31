@@ -239,7 +239,7 @@ void AudioDeviceManager::playback_callback(ma_device *device, void *output, cons
     (void)input;
 
     auto *context = static_cast<AudioCallbackContext *>(device->pUserData);
-    if (!context || !context->running || !context->outputRing || !context->playedOutputFrames)
+    if (!context || !context->running || !context->outputQueue || !context->playedOutputFrames)
     {
         return;
     }
@@ -253,8 +253,8 @@ void AudioDeviceManager::playback_callback(ma_device *device, void *output, cons
         return;
     }
 
-    const uint32_t actualSamples = context->outputRing->pop(outputSamples, requiredSamples);
-    const uint32_t remainingFrames = context->outputRing->available() / context->channels;
+    const uint32_t actualSamples = context->outputQueue->pop(outputSamples, requiredSamples);
+    const uint32_t remainingFrames = context->outputQueue->available() / context->channels;
 
     if (context->minObservedOutputFrames)
     {

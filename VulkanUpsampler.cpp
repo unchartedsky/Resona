@@ -1105,7 +1105,7 @@ size_t VulkanUpsampler::tryPollAll()
         // and confirmed as VK_SUCCESS for this slot before any CPU read occurs.
         uint32_t total = 0;
         uint32_t skipOffset = 0;
-        std::function<void(const float *, uint32_t)> callback;
+        std::function<void(const float *, uint32_t, uint32_t)> callback;
         {
             std::lock_guard<std::mutex> lock(slot.stateMutex);
             total = slot.expectedOutSamples;
@@ -1195,17 +1195,12 @@ size_t VulkanUpsampler::tryPollAll()
         if (callback)
         {
             const float *outputPtr = static_cast<const float *>(slot.outputPtr) + skipOffset;
-            callback(outputPtr, outputFrames);
+            callback(outputPtr, outputFrames, slotIndex);
         }
 
-        // Clear slot state - work complete
+        if (!callback)
         {
-            std::lock_guard<std::mutex> lock(slot.stateMutex);
-            slot.inFlight = false;
-            slot.sequenceId = 0;
-            slot.expectedOutSamples = 0;
-            slot.skipOffset = 0;
-            slot.callback = nullptr;
+            releaseCompletedSlot(slotIndex);
         }
 
         {
@@ -1219,6 +1214,23 @@ size_t VulkanUpsampler::tryPollAll()
     }
 
     return completedCount;
+}
+
+void VulkanUpsampler::releaseCompletedSlot(uint32_t slotIndex)
+{
+    if (slotIndex >= NUM_SLOTS)
+    {
+        return;
+    }
+
+    GpuSlot &slot = slots[slotIndex];
+
+    std::lock_guard<std::mutex> lock(slot.stateMutex);
+    slot.inFlight = false;
+    slot.sequenceId = 0;
+    slot.expectedOutSamples = 0;
+    slot.skipOffset = 0;
+    slot.callback = nullptr;
 }
 
 size_t VulkanUpsampler::getAvailableSlots() const
@@ -1303,8 +1315,8 @@ int VulkanUpsampler::findAvailableSlot()
         }
     }
 
-    // Second pass: All slots marked in-flight - actively reclaim completed work
-    // CRITICAL FIX: We need to clear completed work immediately, not wait for poll()
+    // Second pass: All slots marked in-flight - only reclaim work that does not
+    // have a completion callback keeping the slot alive for deferred consumption.
     for (uint32_t i = 0; i < NUM_SLOTS; ++i)
     {
         const uint32_t slotIndex = (currentSlotIndex + i) % NUM_SLOTS;
@@ -1321,57 +1333,18 @@ int VulkanUpsampler::findAvailableSlot()
             VkResult status = vkGetFenceStatus(device, slot.fence);
             if (status == VK_SUCCESS)
             {
-                // Work completed! Process it immediately and return this slot
-                // This is critical - poll thread might be too slow or blocked
-
-                // ZERO-COPY: Invoke callback directly with GPU memory if callback exists
-                uint32_t total = 0;
-                uint32_t skipOffset = 0;
-                std::function<void(const float *, uint32_t)> callback;
+                bool hasCallback = false;
                 {
                     std::lock_guard<std::mutex> lock(slot.stateMutex);
-                    total = slot.expectedOutSamples;
-                    skipOffset = slot.skipOffset;
-                    callback = slot.callback;
+                    hasCallback = static_cast<bool>(slot.callback);
                 }
 
-                if (total > 0 && callback)
+                if (hasCallback)
                 {
-                    if (slot.outputPtr)
-                    {
-                        // OPTIMIZED: Only invalidate if memory is non-coherent
-                        if (!(outputMemoryProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
-                        {
-                            VkMappedMemoryRange range{};
-                            range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-                            range.memory = slot.outputMemory;
-                            range.offset = 0;
-                            range.size = sizeof(float) * total;
-                            vkInvalidateMappedMemoryRanges(device, 1, &range);
-                        }
-
-                        // Apply skip offset and invoke callback with direct pointer
-                        if (skipOffset <= total)
-                        {
-                            const uint32_t copySamples = total - skipOffset;
-                            const uint32_t outputFrames = copySamples / numChannels;
-
-                            // ZERO-COPY: Pass GPU memory pointer directly (no intermediate copy!)
-                            const float *outputPtr = static_cast<const float *>(slot.outputPtr) + skipOffset;
-                            callback(outputPtr, outputFrames);
-                        }
-                    }
+                    continue;
                 }
 
-                // Clear callback and mark as available
-                {
-                    std::lock_guard<std::mutex> lock(slot.stateMutex);
-                    slot.callback = nullptr;
-                    slot.inFlight = false;
-                    slot.sequenceId = 0;
-                    slot.expectedOutSamples = 0;
-                    slot.skipOffset = 0;
-                }
+                releaseCompletedSlot(slotIndex);
 
                 // Return this slot immediately for reuse
                 return static_cast<int>(slotIndex);

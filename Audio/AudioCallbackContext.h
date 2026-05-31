@@ -1,6 +1,7 @@
 #pragma once
 
 #include "FloatRingBuffer.h"
+#include "OutputBufferQueue.h"
 
 #include <atomic>
 #include <cstdint>
@@ -11,7 +12,7 @@ struct AudioCallbackContext
     std::atomic<bool> *underrun = nullptr;
 
     FloatRingBuffer *inputRing = nullptr;
-    FloatRingBuffer *outputRing = nullptr;
+    OutputBufferQueue *outputQueue = nullptr;
 
     std::atomic<uint64_t> *capturedInputFrames = nullptr;
     std::atomic<uint64_t> *playedOutputFrames = nullptr;

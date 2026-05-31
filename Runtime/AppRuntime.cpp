@@ -54,7 +54,7 @@ bool AppRuntime::recoverPlaybackAfterUnderrun()
 
     waitForOutputPrebuffer();
 
-    const uint32_t currentOutputFrames = outputRing.available() / AudioConfig::CHANNELS;
+    const uint32_t currentOutputFrames = outputQueue.available() / AudioConfig::CHANNELS;
     resetRecoveryTelemetry(currentOutputFrames);
     recalibrateAdaptiveTarget("playback restart");
     return deviceManager->startPlayback();
@@ -68,9 +68,9 @@ void AppRuntime::waitForOutputPrebuffer() const
 
     printf("[*] Waiting for prebuffer (target: %u frames + %u margin)...\n", targetFrames, safetyMargin);
 
-    while (outputRing.available() / AudioConfig::CHANNELS < safeTargetFrames)
+    while (outputQueue.available() / AudioConfig::CHANNELS < safeTargetFrames)
     {
-        const uint32_t currentFrames = outputRing.available() / AudioConfig::CHANNELS;
+        const uint32_t currentFrames = outputQueue.available() / AudioConfig::CHANNELS;
         printf("    Progress: %u/%u frames (%.1f%%)     \r", currentFrames, safeTargetFrames,
                (currentFrames * 100.0f) / safeTargetFrames);
         fflush(stdout);
@@ -78,7 +78,7 @@ void AppRuntime::waitForOutputPrebuffer() const
     }
 
     printf("\n[+] Prebuffer complete (filled: %u frames)                    \n",
-           outputRing.available() / AudioConfig::CHANNELS);
+           outputQueue.available() / AudioConfig::CHANNELS);
 }
 
 void AppRuntime::runMainLoop()
@@ -121,7 +121,7 @@ void AppRuntime::runMainLoop()
 
         if (elapsedMs >= 500)
         {
-            const uint32_t outputBufferFrames = outputRing.available() / AudioConfig::CHANNELS;
+            const uint32_t outputBufferFrames = outputQueue.available() / AudioConfig::CHANNELS;
             const GpuUpsamplerRuntimeStatus upsamplerStatus = upsampler ? upsampler->getRuntimeStatus() : GpuUpsamplerRuntimeStatus{};
 
             const int32_t outputBufferDelta =
@@ -200,13 +200,13 @@ bool AppRuntime::Initialize()
 
     printf("[*] Initializing dual ring buffers...\n");
     inputRing.init(AudioConfig::INPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS);
-    outputRing.init(AudioConfig::OUTPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS);
+    outputQueue.init(AudioConfig::OUTPUT_RING_BUFFER_FRAMES * AudioConfig::CHANNELS, VulkanUpsampler::NUM_SLOTS);
     resetRecoveryTelemetry(AudioConfig::OUTPUT_RING_BUFFER_FRAMES);
 
     gpuProcessingContext.gpuReady = &gpuReady;
     gpuProcessingContext.upsampler = static_cast<VulkanUpsampler *>(upsampler.get());
     gpuProcessingContext.inputRing = &inputRing;
-    gpuProcessingContext.outputRing = &outputRing;
+    gpuProcessingContext.outputQueue = &outputQueue;
     gpuProcessingContext.processedInputFrames = &processedInputFrames;
     gpuProcessingContext.processedOutputFrames = &processedOutputFrames;
     gpuProcessingContext.inputSampleRate = AudioConfig::INPUT_SAMPLE_RATE;
@@ -224,7 +224,7 @@ bool AppRuntime::Initialize()
     audioCallbackContext.running = &running;
     audioCallbackContext.underrun = &underrun;
     audioCallbackContext.inputRing = &inputRing;
-    audioCallbackContext.outputRing = &outputRing;
+    audioCallbackContext.outputQueue = &outputQueue;
     audioCallbackContext.capturedInputFrames = &capturedInputFrames;
     audioCallbackContext.playedOutputFrames = &playedOutputFrames;
     audioCallbackContext.zeroFillEvents = &zeroFillEvents;
@@ -253,7 +253,7 @@ bool AppRuntime::Initialize()
     }
 
     waitForOutputPrebuffer();
-    resetRecoveryTelemetry(outputRing.available() / AudioConfig::CHANNELS);
+    resetRecoveryTelemetry(outputQueue.available() / AudioConfig::CHANNELS);
 
     if (!deviceManager->startPlayback())
     {
@@ -312,6 +312,8 @@ void AppRuntime::Shutdown()
         deviceManager->stopDevices();
         deviceManager.reset();
     }
+
+    outputQueue.reset();
 
     if (upsampler)
     {

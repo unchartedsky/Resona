@@ -74,6 +74,9 @@
     <ClInclude Include="Audio\AudioConfig.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="Audio\OutputBufferQueue.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <None Include="linear.comp">

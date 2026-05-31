@@ -34,6 +34,9 @@ Apply these repository-agnostic guidelines first, then apply project-specific ex
 - Add a simple UI to display input/output source information and allow users to configure filter combinations and settings.
 - Ensure pressure/target logic can be explicitly reinitialized or overridden and document the behavior and configuration options.
 
+### Warning Management
+- When reducing warnings in this repository, prioritize fixing or suppressing warnings in project files and ignore third-party or external files unless explicitly asked.
+
 ## Documentation Requirements
 - Include explicit checks for Vulkan version and miniaudio version in README documentation.
 

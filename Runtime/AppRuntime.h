@@ -3,6 +3,7 @@
 #include "../Audio/AudioCallbackContext.h"
 #include "../Audio/AudioDeviceManager.h"
 #include "../Audio/FloatRingBuffer.h"
+#include "../Audio/OutputBufferQueue.h"
 #include "../GpuUpsampler.h"
 #include "../RenderPipeline/GpuProcessingThread.h"
 
@@ -44,7 +45,7 @@ class AppRuntime
 
     std::unique_ptr<GpuUpsampler> upsampler;
     FloatRingBuffer inputRing;
-    FloatRingBuffer outputRing;
+    OutputBufferQueue outputQueue;
     GpuProcessingContext gpuProcessingContext{};
     GpuProcessingThread gpuProcessor;
 

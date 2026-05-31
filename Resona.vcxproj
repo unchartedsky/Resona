@@ -110,6 +110,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <Optimization>Disabled</Optimization>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -148,6 +149,7 @@
     <ClInclude Include="Audio\AudioConfig.h" />
     <ClInclude Include="Audio\AudioDeviceManager.h" />
     <ClInclude Include="Audio\FloatRingBuffer.h" />
+    <ClInclude Include="Audio\OutputBufferQueue.h" />
     <ClInclude Include="miniaudio.h" />
     <ClInclude Include="RenderPipeline\GpuProcessingThread.h" />
     <ClInclude Include="RenderPipeline\SubmissionPlanner.h" />

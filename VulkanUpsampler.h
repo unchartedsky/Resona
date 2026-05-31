@@ -39,7 +39,7 @@ struct GpuSlot
     uint32_t skipOffset = 0; // samples to skip due to tail
 
     // Callback storage for async API
-    std::function<void(const float *, uint32_t)> callback;
+    std::function<void(const float *, uint32_t, uint32_t)> callback;
 };
 
 /**
@@ -68,10 +68,10 @@ class VulkanUpsampler : public GpuUpsampler
     // ZERO-COPY OPTIMIZATION: Callback receives direct pointer to GPU-mapped memory
     // WARNING: Pointer is only valid during callback execution!
     // Data must be consumed or copied within callback before returning.
-    using CompletionCallback = std::function<void(const float *output, uint32_t outputFrames)>;
+    using CompletionCallback = std::function<void(const float *output, uint32_t outputFrames, uint32_t slotIndex)>;
 
     // === Multi-Slot Configuration ===
-    static constexpr uint32_t NUM_SLOTS = 10; // Increased from 7
+    static constexpr uint32_t NUM_SLOTS = 48;
 
     bool initialize(uint32_t inputRate, uint32_t outputRate, uint32_t channels) override;
 
@@ -89,6 +89,8 @@ class VulkanUpsampler : public GpuUpsampler
     /// @brief Poll and process all completed work without blocking
     /// @return Number of completed works processed
     size_t tryPollAll();
+
+    void releaseCompletedSlot(uint32_t slotIndex);
 
     /// @brief Get number of available slots
     size_t getAvailableSlots() const;

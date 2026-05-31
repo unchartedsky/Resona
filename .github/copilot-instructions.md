@@ -35,7 +35,7 @@ Apply these repository-agnostic guidelines first, then apply project-specific ex
 - Ensure pressure/target logic can be explicitly reinitialized or overridden and document the behavior and configuration options.
 
 ### Warning Management
-- When reducing warnings in this repository, prioritize fixing or suppressing warnings in project files and ignore third-party or external files unless explicitly asked.
+- When reducing warnings in this repository, prioritize fixing internal code so warnings disappear through code changes rather than local suppression. Ignore third-party or external files unless explicitly asked.
 
 ## Documentation Requirements
 - Include explicit checks for Vulkan version and miniaudio version in README documentation.

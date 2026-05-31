@@ -95,7 +95,8 @@ SubmissionPlan SubmissionPlanner::Build(const SubmissionInputs &inputs)
         return plan;
     }
 
-    const uint32_t outputFreeFrames = inputs.outputRingCapacityFrames - inputs.outputBufferFrames;
+    const uint32_t clampedOutputBufferFrames = std::min(inputs.outputBufferFrames, inputs.outputRingCapacityFrames);
+    const uint32_t outputFreeFrames = inputs.outputRingCapacityFrames - clampedOutputBufferFrames;
     const uint32_t totalExpectedOutput = inputs.expectedOutputFramesPerBatch * batchesToSubmit;
     if (outputFreeFrames < totalExpectedOutput)
     {

@@ -1,5 +1,7 @@
 #include "AudioDeviceManager.h"
 
+#include "AudioConfig.h"
+
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -8,13 +10,6 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
-
-namespace
-{
-constexpr uint32_t kInputSampleRate = 44100;
-constexpr uint32_t kOutputSampleRate = 384000;
-constexpr uint32_t kChannels = 2;
-} // namespace
 
 AudioDeviceManager::AudioDeviceManager(AudioCallbackContext *callbackContext)
     : callbackContext(callbackContext)
@@ -29,9 +24,9 @@ AudioDeviceManager::~AudioDeviceManager()
 bool AudioDeviceManager::initializeCapture()
 {
     ma_device_config config = ma_device_config_init(ma_device_type_capture);
-    config.sampleRate = kInputSampleRate;
+    config.sampleRate = AudioConfig::INPUT_SAMPLE_RATE;
     config.capture.format = ma_format_f32;
-    config.capture.channels = kChannels;
+    config.capture.channels = AudioConfig::CHANNELS;
     config.dataCallback = capture_callback;
     config.pUserData = callbackContext;
 
@@ -85,9 +80,9 @@ bool AudioDeviceManager::initializeCapture()
 bool AudioDeviceManager::initializePlayback()
 {
     ma_device_config config = ma_device_config_init(ma_device_type_playback);
-    config.sampleRate = kOutputSampleRate;
+    config.sampleRate = AudioConfig::OUTPUT_SAMPLE_RATE;
     config.playback.format = ma_format_f32;
-    config.playback.channels = kChannels;
+    config.playback.channels = AudioConfig::CHANNELS;
     config.dataCallback = playback_callback;
     config.pUserData = callbackContext;
 
@@ -110,7 +105,7 @@ bool AudioDeviceManager::initializePlayback()
     }
 
     printf("[+] Playback device initialized: %u Hz (requested: %u Hz), %u frames/period, %u periods\n",
-           playbackDevice.sampleRate, kOutputSampleRate, playbackDevice.playback.internalPeriodSizeInFrames,
+           playbackDevice.sampleRate, AudioConfig::OUTPUT_SAMPLE_RATE, playbackDevice.playback.internalPeriodSizeInFrames,
            playbackDevice.playback.internalPeriods);
 
     playbackInitialized = true;

@@ -9,6 +9,13 @@ enum class ResampleKernel {
     Sinc      // Sinc interpolation (not yet implemented)
 };
 
+struct GpuUpsamplerRuntimeStatus {
+    uint32_t busySlots = 0;
+    uint32_t totalSlots = 0;
+    float currentRatio = 0.0f;
+    uint32_t targetBufferLevel = 0;
+};
+
 /// @brief Abstract interface for GPU-based audio resamplers.
 class GpuUpsampler {
 public:
@@ -24,15 +31,13 @@ public:
     /// @param kernel  The resample algorithm to use.
     virtual void setKernel(ResampleKernel kernel) = 0;
 
-    /// @brief Processes input audio and writes upsampled output (deprecated - use async API).
-    /// @deprecated Use VulkanUpsampler::processAsync() for better performance and non-blocking operation.
-    /// @param input          Pointer to interleaved input samples (float32).
-    /// @param inputFrames    Number of input frames (not samples).
-    /// @param output         Pointer to preallocated output buffer (float32).
-    /// @param outputFrames   Updated with number of output frames produced.
-    /// @return true if successful, false otherwise.
-    virtual bool process(const float* input, uint32_t inputFrames,
-        float* output, uint32_t& outputFrames) = 0;
+    /// @brief Reset any adaptive target/baseline capture used for runtime recalibration.
+    /// Default implementation is a no-op for backends without adaptive target state.
+    virtual void resetAdaptiveTarget() {}
+
+    /// @brief Return runtime status used by orchestration/status reporting.
+    /// Default implementation reports an empty status for backends that do not expose these metrics.
+    virtual GpuUpsamplerRuntimeStatus getRuntimeStatus() const { return {}; }
 
     /// @brief Releases GPU resources and shuts down the upsampler.
     virtual void shutdown() = 0;

@@ -1,5 +1,6 @@
 ﻿#include "VulkanUpsampler.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -177,16 +178,6 @@ void VulkanUpsampler::setKernel(ResampleKernel kernel)
     }
 
     printf("[+] Pipeline ready (%s kernel)\n", filename.c_str());
-}
-
-bool VulkanUpsampler::process(const float *input, uint32_t inputFrames, float *output, uint32_t &outputFrames)
-{
-    // Empty stub - deprecated, use processAsync() instead
-    (void)input;
-    (void)inputFrames;
-    (void)output;
-    (void)outputFrames;
-    return false;
 }
 
 void VulkanUpsampler::shutdown()
@@ -504,12 +495,10 @@ bool VulkanUpsampler::createBuffer(VkDeviceSize size, VkBuffer &buffer, VkDevice
     const bool isOutputBuffer = labelStr.find("output") != std::string::npos;
 
     uint32_t memoryTypeIndex;
-    bool foundReBar = false;
 
     try
     {
         memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, BUFFER_MEMORY_PROPS_REBAR);
-        foundReBar = true;
         if (isInputBuffer)
         {
             printf("[+] Using ReBAR memory (DEVICE_LOCAL + HOST_VISIBLE) for %s\n", label);
@@ -1002,104 +991,6 @@ bool VulkanUpsampler::enqueue(const float *input, uint32_t inputFrames)
     return true;
 }
 
-bool VulkanUpsampler::poll(bool &ready, float *output, uint32_t &outputFrames)
-{
-    ready = false;
-
-    // Check if there are any pending works
-    PendingWork work{};
-    {
-        std::lock_guard<std::mutex> lock(pendingQueueMutex);
-        if (pendingQueue.empty())
-        {
-            return true;
-        }
-
-        // Get the oldest pending work (FIFO order)
-        work = pendingQueue.front();
-    }
-    const uint32_t slotIndex = work.slotIndex;
-    GpuSlot &slot = slots[slotIndex];
-
-    if (!slot.inFlight)
-    {
-        // Slot already processed - pop and continue
-        std::lock_guard<std::mutex> lock(pendingQueueMutex);
-        if (!pendingQueue.empty())
-        {
-            pendingQueue.pop();
-        }
-        return true;
-    }
-
-    // Non-blocking fence status check - immediately returns current state
-    VkResult fenceStatus = vkGetFenceStatus(device, slot.fence);
-
-    if (fenceStatus == VK_NOT_READY)
-    {
-        // GPU still working - return immediately without blocking
-        return true;
-    }
-
-    if (fenceStatus != VK_SUCCESS)
-    {
-        printf("[!] Fence status error for slot %u: %d\n", slotIndex, fenceStatus);
-        slot.inFlight = false;
-        std::lock_guard<std::mutex> lock(pendingQueueMutex);
-        if (!pendingQueue.empty())
-        {
-            pendingQueue.pop();
-        }
-        return false;
-    }
-
-    // Fence signaled - GPU work completed, download results
-    const uint32_t total = slot.expectedOutSamples;
-
-    // OPTIMIZED: Use temporary vector for output download
-    std::vector<float> tempOutput(total);
-
-    if (!downloadOutputFromGPU(tempOutput.data(), total, slotIndex))
-    {
-        slot.inFlight = false;
-        std::lock_guard<std::mutex> lock(pendingQueueMutex);
-        if (!pendingQueue.empty())
-        {
-            pendingQueue.pop();
-        }
-        return false;
-    }
-
-    // Apply skip offset and copy to output
-    if (slot.skipOffset > total)
-    {
-        printf("[!] Skip offset %u exceeds total output %u for slot %u\n", slot.skipOffset, total, slotIndex);
-        slot.inFlight = false;
-        pendingQueue.pop();
-        return false;
-    }
-
-    const uint32_t copySamples = total - slot.skipOffset;
-    std::memcpy(output, tempOutput.data() + slot.skipOffset, sizeof(float) * copySamples);
-    outputFrames = copySamples / numChannels;
-
-    // Clear slot state - work complete
-    slot.inFlight = false;
-    slot.sequenceId = 0;
-    slot.expectedOutSamples = 0;
-    slot.skipOffset = 0;
-
-    {
-        std::lock_guard<std::mutex> lock(pendingQueueMutex);
-        if (!pendingQueue.empty())
-        {
-            pendingQueue.pop();
-        }
-    }
-    ready = true;
-    return true;
-}
-
 // === Asynchronous API Implementation ===
 
 uint64_t VulkanUpsampler::processAsync(const float *input, uint32_t inputFrames, CompletionCallback callback)
@@ -1215,7 +1106,7 @@ size_t VulkanUpsampler::tryPollAll()
         // and confirmed as VK_SUCCESS for this slot before any CPU read occurs.
         uint32_t total = 0;
         uint32_t skipOffset = 0;
-        std::function<void(const float *, uint32_t)> callback;
+        std::function<void(const float *, uint32_t, uint32_t)> callback;
         {
             std::lock_guard<std::mutex> lock(slot.stateMutex);
             total = slot.expectedOutSamples;
@@ -1305,17 +1196,12 @@ size_t VulkanUpsampler::tryPollAll()
         if (callback)
         {
             const float *outputPtr = static_cast<const float *>(slot.outputPtr) + skipOffset;
-            callback(outputPtr, outputFrames);
+            callback(outputPtr, outputFrames, slotIndex);
         }
 
-        // Clear slot state - work complete
+        if (!callback)
         {
-            std::lock_guard<std::mutex> lock(slot.stateMutex);
-            slot.inFlight = false;
-            slot.sequenceId = 0;
-            slot.expectedOutSamples = 0;
-            slot.skipOffset = 0;
-            slot.callback = nullptr;
+            releaseCompletedSlot(slotIndex);
         }
 
         {
@@ -1329,6 +1215,23 @@ size_t VulkanUpsampler::tryPollAll()
     }
 
     return completedCount;
+}
+
+void VulkanUpsampler::releaseCompletedSlot(uint32_t slotIndex)
+{
+    if (slotIndex >= NUM_SLOTS)
+    {
+        return;
+    }
+
+    GpuSlot &slot = slots[slotIndex];
+
+    std::lock_guard<std::mutex> lock(slot.stateMutex);
+    slot.inFlight = false;
+    slot.sequenceId = 0;
+    slot.expectedOutSamples = 0;
+    slot.skipOffset = 0;
+    slot.callback = nullptr;
 }
 
 size_t VulkanUpsampler::getAvailableSlots() const
@@ -1413,8 +1316,8 @@ int VulkanUpsampler::findAvailableSlot()
         }
     }
 
-    // Second pass: All slots marked in-flight - actively reclaim completed work
-    // CRITICAL FIX: We need to clear completed work immediately, not wait for poll()
+    // Second pass: All slots marked in-flight - only reclaim work that does not
+    // have a completion callback keeping the slot alive for deferred consumption.
     for (uint32_t i = 0; i < NUM_SLOTS; ++i)
     {
         const uint32_t slotIndex = (currentSlotIndex + i) % NUM_SLOTS;
@@ -1431,57 +1334,18 @@ int VulkanUpsampler::findAvailableSlot()
             VkResult status = vkGetFenceStatus(device, slot.fence);
             if (status == VK_SUCCESS)
             {
-                // Work completed! Process it immediately and return this slot
-                // This is critical - poll thread might be too slow or blocked
-
-                // ZERO-COPY: Invoke callback directly with GPU memory if callback exists
-                uint32_t total = 0;
-                uint32_t skipOffset = 0;
-                std::function<void(const float *, uint32_t)> callback;
+                bool hasCallback = false;
                 {
                     std::lock_guard<std::mutex> lock(slot.stateMutex);
-                    total = slot.expectedOutSamples;
-                    skipOffset = slot.skipOffset;
-                    callback = slot.callback;
+                    hasCallback = static_cast<bool>(slot.callback);
                 }
 
-                if (total > 0 && callback)
+                if (hasCallback)
                 {
-                    if (slot.outputPtr)
-                    {
-                        // OPTIMIZED: Only invalidate if memory is non-coherent
-                        if (!(outputMemoryProperties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
-                        {
-                            VkMappedMemoryRange range{};
-                            range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-                            range.memory = slot.outputMemory;
-                            range.offset = 0;
-                            range.size = sizeof(float) * total;
-                            vkInvalidateMappedMemoryRanges(device, 1, &range);
-                        }
-
-                        // Apply skip offset and invoke callback with direct pointer
-                        if (skipOffset <= total)
-                        {
-                            const uint32_t copySamples = total - skipOffset;
-                            const uint32_t outputFrames = copySamples / numChannels;
-
-                            // ZERO-COPY: Pass GPU memory pointer directly (no intermediate copy!)
-                            const float *outputPtr = static_cast<const float *>(slot.outputPtr) + skipOffset;
-                            callback(outputPtr, outputFrames);
-                        }
-                    }
+                    continue;
                 }
 
-                // Clear callback and mark as available
-                {
-                    std::lock_guard<std::mutex> lock(slot.stateMutex);
-                    slot.callback = nullptr;
-                    slot.inFlight = false;
-                    slot.sequenceId = 0;
-                    slot.expectedOutSamples = 0;
-                    slot.skipOffset = 0;
-                }
+                releaseCompletedSlot(slotIndex);
 
                 // Return this slot immediately for reuse
                 return static_cast<int>(slotIndex);
@@ -1649,10 +1513,10 @@ void VulkanUpsampler::updateAdaptiveParams(uint32_t outputBufferLevel, uint32_t 
 
     adaptiveState.targetBufferLevel = effectiveTarget;
 
-    // Calculate buffer pressure (0.0 = empty, 1.0 = at or above target)
+    // Calculate target-relative fill ratio.
     if (effectiveTarget > 0)
     {
-        adaptiveState.bufferPressure = std::min(1.0f, static_cast<float>(outputBufferLevel) / effectiveTarget);
+        adaptiveState.bufferPressure = static_cast<float>(outputBufferLevel) / effectiveTarget;
     }
     else
     {
@@ -1664,34 +1528,26 @@ void VulkanUpsampler::updateAdaptiveParams(uint32_t outputBufferLevel, uint32_t 
 
     // === ADAPTIVE RATIO ADJUSTMENT ===
     // Strategy:
-    // - Use a very small drift correction only when buffer level is meaningfully
-    //   below target. This compensates for DAC / driver clock mismatches without
-    //   causing large audible pitch or speed changes.
+    // - Use a very small signed drift correction around the captured target level.
+    //   This compensates for DAC / driver clock mismatches without causing large
+    //   audible pitch or speed changes.
     // - Keep a deadband near target so small fluctuations do not modulate ratio.
     // - Smooth ratio changes over time to avoid abrupt transitions.
-    constexpr float deadbandPressure = 0.98f;
-    constexpr float maxBoost = 0.002f;        // Max +0.2% boost when buffer is critically low
-    constexpr float smoothingFactor = 0.05f;  // Slow drift toward target ratio
-
     float targetRatio = adaptiveState.baseRatio;
-    if (adaptiveState.bufferPressure < deadbandPressure)
+    const float ratioDeltaFromTarget = adaptiveState.bufferPressure - 1.0f;
+    if (std::abs(ratioDeltaFromTarget) > AdaptivePolicy::DriftDeadbandRatioDelta)
     {
-        const float normalizedDeficit = (deadbandPressure - adaptiveState.bufferPressure) / deadbandPressure;
-        const float boostFactor = normalizedDeficit * maxBoost;
-        targetRatio = adaptiveState.baseRatio * (1.0f + boostFactor);
+        const float signedError = std::clamp(ratioDeltaFromTarget, -1.0f, 1.0f);
+        const float correction = signedError * AdaptivePolicy::DriftMaxCorrection;
+        targetRatio = adaptiveState.baseRatio * (1.0f - correction);
     }
 
     adaptiveState.currentRatio =
-        adaptiveState.currentRatio * (1.0f - smoothingFactor) + targetRatio * smoothingFactor;
+        adaptiveState.currentRatio * (1.0f - AdaptivePolicy::DriftSmoothingFactor) +
+        targetRatio * AdaptivePolicy::DriftSmoothingFactor;
 
     // Enable adaptive mode
     adaptiveEnabled.store(true, std::memory_order_release);
-}
-
-uint32_t VulkanUpsampler::getRecommendedBatchSize() const
-{
-    // Fixed batch size for consistent performance
-    return 512;
 }
 
 // === NEW: Adaptive Ratio Adjustment Implementation ===
@@ -1706,15 +1562,21 @@ uint32_t VulkanUpsampler::getTargetBufferLevel() const
     return adaptiveState.targetBufferLevel;
 }
 
+GpuUpsamplerRuntimeStatus VulkanUpsampler::getRuntimeStatus() const
+{
+    GpuUpsamplerRuntimeStatus status{};
+    const size_t availableSlots = getAvailableSlots();
+    status.totalSlots = NUM_SLOTS;
+    status.busySlots = static_cast<uint32_t>(NUM_SLOTS - availableSlots);
+    status.currentRatio = getCurrentRatio();
+    status.targetBufferLevel = getTargetBufferLevel();
+    return status;
+}
+
 void VulkanUpsampler::resetAdaptiveTarget()
 {
     // Reset the captured flag to force a new capture on the next update loop
     adaptiveState.initialLevelCaptured = false;
-    printf("[+] Adaptive target reset requested (re-calibration)\n");
+    printf("[+] Adaptive target reset for startup calibration\n");
 }
 
-void VulkanUpsampler::setRatioAdjustmentRange(float range)
-{
-    // No-op: ratio adjustment is disabled
-    (void)range;
-}

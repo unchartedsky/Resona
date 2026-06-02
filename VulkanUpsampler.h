@@ -39,7 +39,7 @@ struct GpuSlot
     uint32_t skipOffset = 0; // samples to skip due to tail
 
     // Callback storage for async API
-    std::function<void(const float *, uint32_t)> callback;
+    std::function<void(const float *, uint32_t, uint32_t)> callback;
 };
 
 /**
@@ -48,21 +48,34 @@ struct GpuSlot
 class VulkanUpsampler : public GpuUpsampler
 {
   public:
+    struct AdaptivePolicy
+    {
+        static constexpr uint32_t FixedBatchFrames = 512;
+        static constexpr uint32_t TargetBufferPercent = 15;
+        static constexpr uint32_t MaxSubmittedBatches = 4;
+
+        static constexpr float SubmitCriticalThreshold = 0.4f;
+        static constexpr float SubmitLowThreshold = 0.7f;
+
+        static constexpr float SleepCriticalThreshold = 0.3f;
+        static constexpr float SleepLowThreshold = 0.6f;
+
+        static constexpr float DriftDeadbandRatioDelta = 0.02f;
+        static constexpr float DriftMaxCorrection = 0.002f;
+        static constexpr float DriftSmoothingFactor = 0.05f;
+    };
+
     // ZERO-COPY OPTIMIZATION: Callback receives direct pointer to GPU-mapped memory
     // WARNING: Pointer is only valid during callback execution!
     // Data must be consumed or copied within callback before returning.
-    using CompletionCallback = std::function<void(const float *output, uint32_t outputFrames)>;
+    using CompletionCallback = std::function<void(const float *output, uint32_t outputFrames, uint32_t slotIndex)>;
 
     // === Multi-Slot Configuration ===
-    static constexpr uint32_t NUM_SLOTS = 10; // Increased from 7
+    static constexpr uint32_t NUM_SLOTS = 48;
 
     bool initialize(uint32_t inputRate, uint32_t outputRate, uint32_t channels) override;
 
     void setKernel(ResampleKernel kernel) override;
-
-    // === Synchronous API (deprecated - empty stub) ===
-    [[deprecated("Use processAsync() for better performance and non-blocking operation")]]
-    bool process(const float *input, uint32_t inputFrames, float *output, uint32_t &outputFrames) override;
 
     // === Asynchronous API (new) ===
 
@@ -77,6 +90,8 @@ class VulkanUpsampler : public GpuUpsampler
     /// @return Number of completed works processed
     size_t tryPollAll();
 
+    void releaseCompletedSlot(uint32_t slotIndex);
+
     /// @brief Get number of available slots
     size_t getAvailableSlots() const;
 
@@ -84,10 +99,6 @@ class VulkanUpsampler : public GpuUpsampler
     /// @param outputBufferLevel Current output buffer level in frames
     /// @param targetBufferLevel Target buffer level in frames
     void updateAdaptiveParams(uint32_t outputBufferLevel, uint32_t targetBufferLevel);
-
-    /// @brief Get recommended batch size based on current adaptive state
-    /// @return Recommended batch size in frames
-    uint32_t getRecommendedBatchSize() const;
 
     /// @brief Get current adaptive ratio
     /// @return Current ratio being used for resampling
@@ -98,20 +109,11 @@ class VulkanUpsampler : public GpuUpsampler
     uint32_t getTargetBufferLevel() const;
 
     /// @brief Reset adaptive target capture (force re-capture)
-    void resetAdaptiveTarget();
+    void resetAdaptiveTarget() override;
 
-    /// @brief Set ratio adjustment range
-    /// @param range Maximum adjustment range (e.g., 0.005 = ±0.5%)
-    void setRatioAdjustmentRange(float range);
-
-    // === Low-level API (for manual control) ===
-    bool enqueue(const float *input, uint32_t inputFrames);
-    bool poll(bool &ready, float *output, uint32_t &outputFrames);
+    GpuUpsamplerRuntimeStatus getRuntimeStatus() const override;
 
     void shutdown() override;
-
-    /// @brief Create shader module from SPIR-V bytecode file
-    VkShaderModule createShaderModule(const std::string &filename);
 
   private:
     // === Initialization and Cleanup ===
@@ -124,6 +126,9 @@ class VulkanUpsampler : public GpuUpsampler
 
     /// @brief Clean up compute pipeline objects
     void cleanupPipeline();
+
+    /// @brief Create shader module from SPIR-V bytecode file
+    VkShaderModule createShaderModule(const std::string &filename);
 
     void cleanupSlotBuffers(GpuSlot &slotRef);
 
@@ -173,6 +178,9 @@ class VulkanUpsampler : public GpuUpsampler
     /// @param outSamples Output sample count
     /// @param slotIndex Target slot index
     bool dispatch(uint32_t inSamples, uint32_t outSamples, uint32_t slotIndex);
+
+    // === Internal Submission API ===
+    bool enqueue(const float *input, uint32_t inputFrames);
 
     // === Slot Management ===
 

@@ -55,8 +55,18 @@ class FloatRingBuffer
             return;
         }
 
-        const uint32_t writeIdx = writePos.load(std::memory_order_relaxed);
-        const uint32_t writeOffset = useFastModulo ? (writeIdx & sizeMask) : (writeIdx % size);
+        const uint64_t readIdx = readPos.load(std::memory_order_acquire);
+        const uint64_t writeIdx = writePos.load(std::memory_order_relaxed);
+        const uint64_t currentAvailable = writeIdx - readIdx;
+
+        if (currentAvailable + count > size)
+        {
+            const uint64_t samplesToDiscard = (currentAvailable + count) - size;
+            readPos.store(readIdx + samplesToDiscard, std::memory_order_release);
+        }
+
+        const uint32_t writeOffset =
+            useFastModulo ? static_cast<uint32_t>(writeIdx & sizeMask) : static_cast<uint32_t>(writeIdx % size);
 
         if (count > 64)
         {
@@ -79,17 +89,18 @@ class FloatRingBuffer
 
     uint32_t pop(float *out, uint32_t count) noexcept
     {
-        const uint32_t readIdx = readPos.load(std::memory_order_relaxed);
-        const uint32_t writeIdx = writePos.load(std::memory_order_acquire);
-        const uint32_t available = writeIdx - readIdx;
-        const uint32_t toRead = std::min(count, available);
+        const uint64_t readIdx = readPos.load(std::memory_order_relaxed);
+        const uint64_t writeIdx = writePos.load(std::memory_order_acquire);
+        const uint64_t available = std::min<uint64_t>(writeIdx - readIdx, size);
+        const uint32_t toRead = static_cast<uint32_t>(std::min<uint64_t>(count, available));
 
         if (toRead == 0) [[unlikely]]
         {
             return 0;
         }
 
-        const uint32_t readOffset = useFastModulo ? (readIdx & sizeMask) : (readIdx % size);
+        const uint32_t readOffset =
+            useFastModulo ? static_cast<uint32_t>(readIdx & sizeMask) : static_cast<uint32_t>(readIdx % size);
 
         if (toRead > 64)
         {
@@ -113,7 +124,9 @@ class FloatRingBuffer
 
     uint32_t available() const noexcept
     {
-        return writePos.load(std::memory_order_acquire) - readPos.load(std::memory_order_relaxed);
+        const uint64_t readIdx = readPos.load(std::memory_order_relaxed);
+        const uint64_t writeIdx = writePos.load(std::memory_order_acquire);
+        return static_cast<uint32_t>(std::min<uint64_t>(writeIdx - readIdx, size));
     }
 
   private:
@@ -123,8 +136,8 @@ class FloatRingBuffer
 #pragma warning(push)
 #pragma warning(disable : 4324)
 #endif
-    alignas(64) std::atomic<uint32_t> writePos{0};
-    alignas(64) std::atomic<uint32_t> readPos{0};
+    alignas(64) std::atomic<uint64_t> writePos{0};
+    alignas(64) std::atomic<uint64_t> readPos{0};
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif

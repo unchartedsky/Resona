@@ -83,8 +83,10 @@ void GpuProcessingThread::runLoop()
         const uint32_t batchSamples = batchFrames * context->channels;
         const uint32_t availableInputFrames = context->inputRing->available() / context->channels;
         const size_t availableSlots = context->upsampler->getAvailableSlots();
-        const float ratio = static_cast<float>(context->outputSampleRate) / context->inputSampleRate;
-        const uint32_t expectedOutputFramesPerBatch = static_cast<uint32_t>(batchFrames * ratio);
+        const float baseRatio = static_cast<float>(context->outputSampleRate) / context->inputSampleRate;
+        const float adaptiveRatio = context->upsampler->getCurrentRatio();
+        const float plannerRatio = adaptiveRatio > 0.0f ? adaptiveRatio : baseRatio;
+        const uint32_t expectedOutputFramesPerBatch = static_cast<uint32_t>(batchFrames * plannerRatio);
 
         SubmissionInputs plannerInputs{};
         plannerInputs.outputBufferFrames = outputBufferFrames;

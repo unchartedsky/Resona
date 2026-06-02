@@ -27,6 +27,10 @@ class FloatRingBuffer
     {
         buffer.resize(totalSamples);
         size = totalSamples;
+        sizeMask = 0;
+        useFastModulo = false;
+        writePos.store(0, std::memory_order_relaxed);
+        readPos.store(0, std::memory_order_relaxed);
 
         const bool isPowerOf2 = (size & (size - 1)) == 0;
         if (!isPowerOf2)

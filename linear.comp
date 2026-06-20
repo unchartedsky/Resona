@@ -20,34 +20,37 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
-    if (gid >= pc.outFrameCount * 2) return;
+    if (gid >= pc.outFrameCount * 2u) return;
 
-    if (pc.inFrameCount < 2u || pc.outFrameCount == 0u) return;
+    if (pc.inFrameCount == 0u || pc.outFrameCount == 0u) return;
 
-    uint channel = gid & 1;
-    uint outFrameIndex = gid >> 1;
+    uint channel = gid & 1u;
+    uint outFrameIndex = gid >> 1u;
 
-    // Integer position calculation (avoids float precision issues)
-    uint inFrame = (outFrameIndex * pc.inFrameCount) / pc.outFrameCount;
-    
-    // CRITICAL: Clamp inFrame so that inFrame + 1 is ALWAYS valid
-    uint maxValidFrame = pc.inFrameCount - 2;
-    if (inFrame > maxValidFrame) {
-        inFrame = maxValidFrame;
+    if (pc.inFrameCount < 2u || pc.outFrameCount < 2u) {
+        uint inFrame = min(outFrameIndex, pc.inFrameCount - 1u);
+        outSamples[gid] = inSamples[inFrame * 2u + channel];
+        return;
     }
-    
-    // Both frame0 and frame1 are guaranteed valid
-    uint frame0 = inFrame;
-    uint frame1 = inFrame + 1;
-    
-    // Calculate fractional part using integer math
-    uint numerator = outFrameIndex * pc.inFrameCount;
-    uint remainder = numerator - (inFrame * pc.outFrameCount);
-    float frac = float(remainder) / float(pc.outFrameCount);
+
+    // Map endpoints exactly across the full source range and keep frac within [0, 1].
+    uint numerator = outFrameIndex * (pc.inFrameCount - 1u);
+    uint denominator = pc.outFrameCount - 1u;
+    uint frame0 = numerator / denominator;
+    uint remainder = numerator % denominator;
+
+    uint maxValidFrame = pc.inFrameCount - 2u;
+    if (frame0 > maxValidFrame) {
+        frame0 = maxValidFrame;
+        remainder = denominator;
+    }
+
+    uint frame1 = frame0 + 1u;
+    float frac = float(remainder) / float(denominator);
     
     // Fetch samples
-    float s0 = inSamples[frame0 * 2 + channel];
-    float s1 = inSamples[frame1 * 2 + channel];
+    float s0 = inSamples[frame0 * 2u + channel];
+    float s1 = inSamples[frame1 * 2u + channel];
     
     // Linear interpolation
     float result = s0 + frac * (s1 - s0);

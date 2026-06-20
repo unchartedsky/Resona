@@ -133,7 +133,7 @@ void AppRuntime::runMainLoop()
 
             if (targetBufferFrames > 0)
             {
-                bufferPressure = std::min(1.0f, static_cast<float>(outputBufferFrames) / targetBufferFrames);
+                bufferPressure = (std::min)(1.0f, static_cast<float>(outputBufferFrames) / targetBufferFrames);
             }
 
             const float baseRatio = static_cast<float>(AudioConfig::OUTPUT_SAMPLE_RATE) /
